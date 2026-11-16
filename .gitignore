@@ -94,3 +94,6 @@ voice_state.json
 .gondor_streaming.lock
 *.part
 package-lock.json
+
+# Docker bind-mounted state (likes, settings, whitelist, playlists on the server)
+data/

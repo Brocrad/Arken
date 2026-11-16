@@ -144,6 +144,21 @@ MEDIA_DIR.mkdir(exist_ok=True)
 MEDIA_EXTS = (".webm", ".m4a", ".mp4", ".opus", ".mp3", ".ogg")
 QUEUE_DIR.mkdir(exist_ok=True)
 
+
+def _state_file(name: str, default: Path | None = None) -> Path:
+    """Where a small persistent JSON state file lives.
+
+    If GONDOR_STATE_DIR is set (e.g. /data in Docker) the file goes there, so one mounted volume holds
+    all of it. Otherwise behaviour is unchanged: `default`, or `name` relative to the working directory.
+    """
+    d = os.environ.get("GONDOR_STATE_DIR", "").strip()
+    if d:
+        p = Path(d)
+        p.mkdir(parents=True, exist_ok=True)
+        return p / name
+    return default if default is not None else Path(name)
+
+
 # Background audio processor (audio_processor_service.py) — spawned automatically unless already running
 _audio_processor_child: subprocess.Popen | None = None
 
@@ -385,8 +400,8 @@ _playlist_advance_pending = set()
 notification_channels = {}  # {guild_id: channel} - tracks where to send music notifications
 
 # Voice channel state management
-VOICE_STATE_FILE = Path("voice_state.json")
-PLAYBACK_STATE_FILE = Path("playback_state.json")
+VOICE_STATE_FILE = _state_file("voice_state.json")
+PLAYBACK_STATE_FILE = _state_file("playback_state.json")
 
 def set_notification_channel(guild_id, channel):
     """Set the notification channel for a guild"""
@@ -835,7 +850,7 @@ async def restore_playback_state():
 # 🛡️ WHITELIST SECURITY SYSTEM
 # ============================================================================
 
-WHITELIST_FILE = Path("user_whitelist.json")
+WHITELIST_FILE = _state_file("user_whitelist.json")
 
 def load_whitelist():
     """Load authorized users from whitelist file"""
@@ -2970,7 +2985,7 @@ async def _finish_summon(msg, anim, content):
 #    the chat commands and the now-playing buttons so both behave identically.
 # ============================================================================
 
-SETTINGS_FILE = Path(__file__).resolve().parent / "gondor_settings.json"
+SETTINGS_FILE = _state_file("gondor_settings.json", Path(__file__).resolve().parent / "gondor_settings.json")
 NOTE_SECONDS = max(0.0, float(os.environ.get("GONDOR_NOTE_SECONDS", "12")))
 PRESENCE_ENABLED = _env_flag("GONDOR_PRESENCE")
 NP_COUNTDOWN = _env_flag("GONDOR_NP_COUNTDOWN")
@@ -5473,7 +5488,7 @@ async def voice_region(ctx):
 #    goes through the audio processor like every download does: the bot itself never touches the net.
 # ============================================================================
 
-DATA = extras.JsonStore(Path(os.environ.get("GONDOR_DATA_FILE") or (Path(__file__).resolve().parent / "gondor_data.json")))
+DATA = extras.JsonStore(Path(os.environ.get("GONDOR_DATA_FILE") or _state_file("gondor_data.json", Path(__file__).resolve().parent / "gondor_data.json")))
 AUTOPLAY_MAX = max(1, int(os.environ.get("GONDOR_AUTOPLAY_MAX", "25")))   # songs in a row without a human request
 RECAP_ENABLED = _env_flag("GONDOR_RECAP")             # weekly "what did we listen to" post
 LYRICS_ENABLED = _env_flag("GONDOR_LYRICS")           # master switch for lyric lookups

@@ -1,0 +1,41 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Runtime state (lives in the /data volume or is recreated)
+data/
+media_library/
+request_queue/
+playlists/
+gif_cache/
+gondor_data.json
+gondor_settings.json
+playback_state.json
+voice_state.json
+user_whitelist.json
+*.pid
+*.lock
+*.part
+
+# VCS / Python / editor / OS
+.git
+.gitignore
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+node_modules/
+package-lock.json
+
+# Not needed in the image
+README.md
+*.md
+*.bat
+original_music_bot.py
+Dockerfile
+docker-compose.yml
+.dockerignore

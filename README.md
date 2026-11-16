@@ -42,6 +42,25 @@ A reliable Discord music bot that plays music from YouTube using the power of Py
    python music_bot.py
    ```
 
+## 🐳 Docker (Linux server)
+
+```bash
+git clone https://github.com/Brocrad/Gondor.git && cd Gondor
+cp .env.example .env && nano .env                # set NEW_DISCORD_TOKEN
+mkdir -p data/playlists                          # create as your normal user so the container can write to it
+# Copy over your existing state (from your PC) into ./data:
+#   user_whitelist.json  (REQUIRED - without it nobody is authorized for admin commands)
+#   gondor_data.json, gondor_settings.json, and the contents of playlists/ -> data/playlists/
+docker compose up -d --build
+docker compose logs -f
+```
+
+- State lives in `./data` (likes/history/stats, per-server settings, whitelist, saved session, playlists). Back that folder up.
+- Stop your local bot first: two bots on one token cause voice 4006 loops.
+- If your server user isn't uid/gid 1000, set `GONDOR_UID` / `GONDOR_GID` in `.env` (see `id`) before building.
+- `!reboot` works (the container restarts itself). To update the code or yt-dlp: `git pull && docker compose up -d --build`. `!deps update` only lasts until the container is recreated.
+- Downloaded audio is a temporary cache inside the container and is not persisted.
+
 ## 🎮 Commands
 
 ⚠️ **Important:** Use `!summon` first to bring the bot to your voice channel!

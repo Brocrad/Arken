@@ -1,0 +1,26 @@
+services:
+  gondor:
+    build:
+      context: .
+      args:
+        # Match the owner of ./data on the server (run `id -u` / `id -g`).
+        UID: ${GONDOR_UID:-1000}
+        GID: ${GONDOR_GID:-1000}
+    image: gondor:latest
+    container_name: gondor
+    # `!reboot` makes the bot exit cleanly (code 0), so this must be unless-stopped/always,
+    # not on-failure.
+    restart: unless-stopped
+    env_file: .env          # NEW_DISCORD_TOKEN and optional GONDOR_* toggles (never baked into the image)
+    volumes:
+      # Persistent state: likes/history/stats, per-server settings, whitelist, saved session.
+      - ./data:/data
+      # Saved playlists. Mounted at the relative path the bot expects.
+      - ./data/playlists:/app/playlists
+    # Voice uses outbound UDP only; no ports need publishing.
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
