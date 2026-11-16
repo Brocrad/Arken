@@ -205,6 +205,7 @@ def build_remote_script(remote_dir: str, bundle_name: str, *, clean: bool, resta
     return f"""set -eu
 REMOTE_DIR={shlex.quote(remote_dir)}
 BUNDLE="/tmp/"{shlex.quote(bundle_name)}
+trap 'rm -f "$BUNDLE"' EXIT   # never leave the upload behind, even if a step below fails
 CLEAN={1 if clean else 0}
 RESTART={1 if restart else 0}
 
