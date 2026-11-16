@@ -5,6 +5,8 @@
 
 # Runtime state (lives in the /data volume or is recreated)
 data/
+data.bak-*
+deploy/
 media_library/
 request_queue/
 playlists/

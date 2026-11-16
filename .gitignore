@@ -97,3 +97,4 @@ package-lock.json
 
 # Docker bind-mounted state (likes, settings, whitelist, playlists on the server)
 data/
+data.bak-*

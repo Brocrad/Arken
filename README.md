@@ -44,15 +44,29 @@ A reliable Discord music bot that plays music from YouTube using the power of Py
 
 ## 🐳 Docker (Linux server)
 
+On the server:
+
 ```bash
 git clone https://github.com/Brocrad/Gondor.git && cd Gondor
 cp .env.example .env && nano .env                # set NEW_DISCORD_TOKEN
-mkdir -p data/playlists                          # create as your normal user so the container can write to it
-# Copy over your existing state (from your PC) into ./data:
-#   user_whitelist.json  (REQUIRED - without it nobody is authorized for admin commands)
-#   gondor_data.json, gondor_settings.json, and the contents of playlists/ -> data/playlists/
-docker compose up -d --build
-docker compose logs -f
+docker compose build
+```
+
+Then, **from the PC that has your current data**, push the state to the server (needs `ssh`/`scp`, key auth recommended):
+
+```bash
+python deploy/sync_state.py user@your-server                  # add --remote-dir /path/to/Gondor, -p PORT, -i KEYFILE
+```
+
+It bundles your whitelist, likes/history/stats, per-server settings, playlists **and their stored audio files**,
+rewrites Windows paths in the playlist JSON to Linux ones (otherwise the bot drops those songs as "missing"),
+copies it over with `scp`, backs up any existing `data/` on the server, installs it and starts the container.
+Useful flags: `--authorize <your Discord id>` (build the whitelist from scratch), `--no-audio`, `--clean`
+(replace instead of merge), `--no-restart`, `--bundle-only FILE` (no network; copy it yourself).
+Your local files are never modified. `media_library/` is only a download cache and is not copied.
+
+```bash
+docker compose logs -f                                         # on the server
 ```
 
 - State lives in `./data` (likes/history/stats, per-server settings, whitelist, saved session, playlists). Back that folder up.
