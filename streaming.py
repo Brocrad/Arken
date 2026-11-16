@@ -123,7 +123,45 @@ print(f"   voice_states: {intents.voice_states}")
 print(f"   guild_messages: {intents.guild_messages}")
 print(f"   guilds: {intents.guilds}")
 
-bot = commands.Bot(command_prefix='!', intents=intents, description="File streaming utility")
+bot = commands.Bot(command_prefix='!', intents=intents, description="Arken Discord music bot")
+
+
+class ArkenHelpCommand(commands.HelpCommand):
+    """Readable !help — same guide as !commands; !help <cmd> shows one-line detail."""
+
+    def __init__(self):
+        super().__init__(
+            command_attrs={"help": "Command guide (same as !commands)"},
+            no_category="Commands",
+        )
+
+    async def send_bot_help(self, mapping):
+        embed = _build_command_guide_embed(self.context.author)
+        await self.get_destination().send(embed=embed)
+
+    async def send_command_help(self, command):
+        text = command.help or command.brief or "No description."
+        embed = discord.Embed(
+            title=f"!{command.qualified_name}",
+            description=text,
+            color=0x7e57c2,
+        )
+        if command.usage:
+            embed.add_field(name="Usage", value=f"`!{command.qualified_name} {command.usage}`", inline=False)
+        if command.aliases:
+            embed.add_field(
+                name="Aliases",
+                value=" · ".join(f"`!{a}`" for a in command.aliases),
+                inline=False,
+            )
+        embed.set_footer(text="Full guide: !help · !commands")
+        await self.get_destination().send(embed=embed)
+
+    async def send_group_help(self, group):
+        await self.send_command_help(group)
+
+
+bot.help_command = ArkenHelpCommand()
 
 if aenv.get("VOICE_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"):
     logging.basicConfig(level=logging.DEBUG)
@@ -4658,136 +4696,99 @@ async def kill(ctx):
     else:
         await ctx.send("❌ Not connected")
 
-@bot.command(name="commands", help="Show available commands")
-async def show_commands(ctx):
-    """Show help"""
+def _build_command_guide_embed(member: discord.Member) -> discord.Embed:
+    """Shared embed for !help and !commands."""
     embed = discord.Embed(
-        title="🎵 Arken Music Bot Commands",
-        description="⚠️ **Important:** Use `!summon` first to bring me to your voice channel!\n\nYour advanced Discord music bot with media management!",
-        color=0x00ff00
-    )
-    
-    embed.add_field(
-        name="🎶 Music Commands (Require !summon first)",
-        value=(
-            "`!play <search or url>` - Stream audio content (auto-queues if busy)\n"
-            "`!pause` - Pause the current song\n"
-            "`!resume` - Resume playback\n"
-            "`!skip` - Skip to the next track ⏭️\n"
-            "`!seek <1:30 | +30 | -15>` / `!forward [s]` / `!rewind [s]` - Jump around in the song ⏩\n"
-            "`!volume [0-200 | +10 | -10]` / `!mute` - Show or set the volume, or mute 🔊\n"
-            "`!style [name]` - Badge look: vaporwave, matrix, sunset, synthwave, auto 🎨\n"
-            "`!stop` - Stop current song (bot stays in channel)\n"
-            "`!queue` - Show current song queue 📋\n"
-            "`!clearqueue` - Clear all queued songs 🗑️"
+        title="🎵 Arken — command guide",
+        description=(
+            "**Start here:** `!summon` in a voice channel, then play music.\n"
+            "DJ commands need **open play** (default on), the server's DJ role, or Manage Server.\n"
+            "Detail for one command: `!help play`"
         ),
-        inline=False
+        color=0x7e57c2,
     )
-    
+
     embed.add_field(
-        name="🔧 Control Commands", 
+        name="Voice",
+        value="`!summon` · join your channel\n`!kill` · leave voice",
+        inline=True,
+    )
+    embed.add_field(
+        name="Playback (DJ)",
         value=(
-            "`!summon` - Summon bot to your voice channel\n"
-            "`!kill` - Disconnect bot from voice channel 💀\n"
-            "`!commands` - Show this commands list"
+            "`!play` · search or URL\n"
+            "`!pause` · `!resume` · `!skip` · `!stop`\n"
+            "`!seek` · `!forward` · `!rewind`\n"
+            "`!volume` · `!mute` · `!style`"
         ),
-        inline=False
+        inline=True,
     )
-    
     embed.add_field(
-        name="🔍 Diagnostic Commands",
+        name="Queue",
+        value="`!queue` · list / manage\n`!clearqueue` · `!voteskip`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Playlists (DJ)",
         value=(
-            "`!diagnose` - Run bot diagnostics\n"
-            "`!nettest` - Test network connectivity"
+            "`!playlist` · full playlist help\n"
+            "`!playlist create` · `!playlist play` · shuffle / loop\n"
+            "`!playlist prev` · skip with `!skip`"
         ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🌍 Regional Settings",
-        value=(
-            "`!region` - Show current audio settings\n"
-            "`!region us` - US/English audio (48kHz, stereo)\n"
-            "`!region eu` - European audio (44.1kHz, stereo)\n"
-            "`!region hq` - High Quality audio (192k)\n"
-            "`!region voice` - Voice optimized (mono, low latency)\n"
-            "`!voiceregion` - Show voice channel region info"
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="👤 User (everyone)",
-        value="`!summon` `!kill` `!queue` `!like` `!history` `!stats` `!dashboard` `!voteskip`",
-        inline=False,
-    )
-    embed.add_field(
-        name="🎧 DJ controls",
-        value=(
-            "`!play` `!skip` `!volume` `!playlist` `!effect` `!autoplay` …\n"
-            "Allowed when **openplay** is on (default), or you have the DJ role / Manage Server "
-            "(or are an Arken **owner**)."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="🛠️ Server admin",
-        value="`!openplay [on|off]` (default **on**) · `!djrole @Role | off`",
         inline=False,
     )
 
-    role = staff_role(ctx.author.id)
+    embed.add_field(
+        name="Everyone",
+        value=(
+            "`!like` · `!likes` · `!history` · `!stats` · `!dashboard`\n"
+            "`!queue` · `!voteskip`"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Extras",
+        value="`!effect` · `!fade` · `!sleep` · `!lyrics`\n`!autoplay` · `!guess`",
+        inline=True,
+    )
+
+    if member_can_server_admin(member):
+        embed.add_field(
+            name="Server policy",
+            value="`!openplay on|off` · `!djrole @Role | off`",
+            inline=False,
+        )
+
+    role = staff_role(member.id)
     if role:
         embed.add_field(
-            name=f"🛡️ Staff (`{role}`)",
+            name=f"Staff ({role})",
             value=(
-                "`!guilds` `!tokens` `!allowguild` `!leaveguild` · `!whitelist` "
-                "`!reboot` `!deps` `!diagnose` — gated by your role's capabilities"
+                "**Guilds:** `!guilds` · `!allowguild` · `!leaveguild` · `!tokens`\n"
+                "**Ops:** `!whitelist` · `!reboot` · `!deps` · `!rejoin`\n"
+                "**Debug:** `!diagnose` · `!nettest` · `!region` · `!test`"
             ),
             inline=False,
         )
-        embed.set_footer(text=f"Staff role: {role}")
-    elif member_can_server_admin(ctx.author):
-        embed.set_footer(text="You can change this server's Arken policy")
-    elif member_can_control(ctx.author):
-        embed.set_footer(text="You can use DJ controls in this server")
-    else:
-        embed.set_footer(text="Open play is off — ask an admin for the DJ role")
-    
-    embed.add_field(
-        name="📋 Playlist Commands",
-        value=(
-            "`!playlist` - Show all playlist commands\n"
-            "`!playlist create <name>` - Create new playlist\n"
-            "`!playlist play <name>` - Play entire playlist\n"
-            "`!playlist shuffle` - Toggle shuffle mode 🔀\n"
-            "`!playlist loop <mode>` - Set loop mode 🔁\n"
-            "`!skip` / `!playlist skip` - Skip to next track ⏭️\n"
-            "`!playlist prev` - Previous track ⏮️"
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="✨ Extras",
-        value=(
-            "`!effect [slowed|vaporwave|nightcore|reverb|bass|8d|speed 1.25|off]` 🎛️\n"
-            "`!fade [seconds|off]` - Fade songs in and out\n"
-            "`!sleep [30m|1h30m|end|off]` - Sleep timer 😴\n"
-            "`!queue` - Interactive queue (move, play now, remove)\n"
-            "`!voteskip` / 🗳️ - Vote to skip (majority of listeners)\n"
-            "`!like` `!likes [play|remove N]` `!history` - Favourites & history ❤️\n"
-            "`!lyrics [on|off|full]` - Live lyrics under the bar 🎤\n"
-            "`!autoplay [on|off]` - Keep similar songs coming 📻\n"
-            "`!guess [rounds] [playlist url]` - Guess-the-song game 🎲\n"
-            "`!stats [day|week|month|all]` - Listening stats 📊\n"
-            "`!dashboard` - Home panel: resume last session, favourites, radio, quick settings 🏠"
-        ),
-        inline=False
-    )
 
-    embed.set_footer(text="Use !commands to see this message anytime • Made with ❤️")
-    await ctx.send(embed=embed)
+    if role == "owner":
+        footer = "Arken owner — full staff capabilities in every server"
+    elif role == "operator":
+        footer = f"Staff role: {role} · manage guilds/runtime per capability"
+    elif member_can_server_admin(member):
+        footer = "You can change open play and DJ role for this server"
+    elif member_can_control(member):
+        footer = "You can use DJ controls in this server"
+    else:
+        footer = "Need DJ access? Ask for the DJ role or enable open play"
+    embed.set_footer(text=f"{footer} · !help · !commands")
+    return embed
+
+
+@bot.command(name="commands", help="Show available commands (same as !help)")
+async def show_commands(ctx):
+    await ctx.send(embed=_build_command_guide_embed(ctx.author))
 
 @bot.command(name="diagnose", help="Run diagnostics (staff: diagnose)")
 @require_staff("diagnose")
