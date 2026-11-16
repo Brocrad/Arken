@@ -5959,7 +5959,7 @@ def _parse_allowguild_flags(note: str | None) -> tuple[str | None, bool, str | N
 @bot.command(
     name="allowguild",
     aliases=["approveguild"],
-    help="Approve a server; pool city locks when that city's bot joins (or use --auto/--token)",
+    help="Approve a server (owners: any token; operators: this bot only)",
 )
 @require_staff("manage_guilds")
 async def allowguild_cmd(ctx, guild_id: str = None, *, note: str = None):
@@ -5967,14 +5967,34 @@ async def allowguild_cmd(ctx, guild_id: str = None, *, note: str = None):
         await ctx.send(
             "❌ Usage: `!allowguild <server_id> [note]`\n"
             "**Default:** approve only — invite a city bot; `source=invite` locks the token.\n"
-            "`!allowguild <id> --auto` — balance before invite. "
-            "`!allowguild <id> --token osgiliath` — reserve a city before invite."
+            "**Owners:** `--auto` / `--token <city>` from any server.\n"
+            "**Operators:** this city's bot only (where you run the command)."
         )
         return
     gid = int(guild_id)
     g = bot.get_guild(gid)
     members = _guild_member_count(g) if g else 0
     reg_note, auto_balance, force_token = _parse_allowguild_flags(note)
+    owner = is_owner(ctx.author.id)
+    if not owner:
+        if ctx.guild is None:
+            await ctx.send("❌ **Operators** must run `!allowguild` in a server where **this** bot is present.")
+            return
+        if auto_balance or (force_token and force_token != (TOKEN_ID or "").lower()):
+            city = tenancy.display_token_name(TOKEN_ID) if TOKEN_ID else "this bot"
+            await ctx.send(
+                f"❌ **Operators** may only approve for **{city}** (this instance). "
+                "Owners may use `--auto` or `--token <city>` from any server."
+            )
+            return
+        if TOKEN_POOL.enabled() and TOKEN_ID:
+            locked = TOKEN_POOL.token_of(gid)
+            if locked and locked != TOKEN_ID and not _invite_overrides_pool_assignment(gid):
+                await ctx.send(
+                    f"❌ This server is locked to **{tenancy.display_token_name(locked)}**. "
+                    f"Use that city's bot or ask an **owner**."
+                )
+                return
     assigned = TOKEN_POOL.token_of(gid) if TOKEN_POOL.enabled() else None
     seat = TOKEN_POOL.seat_of(gid) if TOKEN_POOL.enabled() else None
     if TOKEN_POOL.enabled():
