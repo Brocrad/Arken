@@ -1091,6 +1091,22 @@ def _guild_member_count(guild) -> int:
         return 0
 
 
+def _invite_overrides_pool_assignment(guild_id) -> bool:
+    """True if this process may reclaim the guild for its OAuth invite.
+
+    Locked assignments (source=invite on another token) mean the wrong city bot was invited.
+    Staff/balance pre-reservations without a join are overridden by whichever bot actually joins.
+    """
+    meta = TOKEN_POOL.assignment_of(guild_id)
+    if not meta:
+        return True
+    owner = meta.get("token_id")
+    if not owner or owner == TOKEN_ID:
+        return True
+    src = str(meta.get("source") or "balance").strip().lower()
+    return src != "invite"
+
+
 async def _pool_claim_from_invite(guild) -> bool:
     """Lock a guild to this OAuth bot (ARKEN_TOKEN_ID) when it joins via invite.
 
@@ -1101,18 +1117,26 @@ async def _pool_claim_from_invite(guild) -> bool:
         return True
     members = _guild_member_count(guild)
     owner = TOKEN_POOL.token_of(guild.id)
+    force = False
     if owner is not None and owner != TOKEN_ID:
-        city = tenancy.display_token_name(owner)
-        here = tenancy.display_token_name(TOKEN_ID)
-        print(
-            f"🛡️ {guild.name} ({guild.id}) is assigned to **{owner}** ({city}) "
-            f"but joined via **{TOKEN_ID}** ({here}) — leaving"
-        )
-        try:
-            await guild.leave()
-        except Exception as e:
-            print(f"⚠️ Could not leave {guild.name}: {e}")
-        return False
+        if _invite_overrides_pool_assignment(guild.id):
+            print(
+                f"🛡️ Invite claim overrides stale assign {owner} → {TOKEN_ID} "
+                f"for {guild.name} ({guild.id})"
+            )
+            force = True
+        else:
+            city = tenancy.display_token_name(owner)
+            here = tenancy.display_token_name(TOKEN_ID)
+            print(
+                f"🛡️ {guild.name} ({guild.id}) is locked to **{owner}** ({city}) via invite; "
+                f"this join is **{TOKEN_ID}** ({here}) — leaving"
+            )
+            try:
+                await guild.leave()
+            except Exception as e:
+                print(f"⚠️ Could not leave {guild.name}: {e}")
+            return False
     try:
         TOKEN_POOL.assign(
             guild.id,
@@ -1120,6 +1144,7 @@ async def _pool_claim_from_invite(guild) -> bool:
             members=members,
             name=guild.name,
             source="invite",
+            force=force,
         )
         seat = TOKEN_POOL.seat_of(guild.id)
         print(f"🛡️ Invite claim {guild.name} ({guild.id}) → {seat or TOKEN_ID}")
@@ -2413,17 +2438,9 @@ async def on_ready():
         status = GUILD_REGISTRY.seen(guild.id, guild.name)
         if status != "approved":
             print(f"⚠️ Server not approved ({status}): {guild.name} ({guild.id})")
-            if TOKEN_POOL.enabled() and TOKEN_ID:
-                owner = TOKEN_POOL.token_of(guild.id)
-                if owner is not None and owner != TOKEN_ID:
-                    print(f"🛡️ {guild.name} pending but reserved for token {owner} — leaving")
-                    try:
-                        await guild.leave()
-                    except Exception:
-                        pass
+            if TOKEN_POOL.enabled() and TOKEN_ID and not LEAVE_UNAPPROVED:
+                if not await _pool_claim_from_invite(guild):
                     continue
-                if not LEAVE_UNAPPROVED:
-                    await _pool_claim_from_invite(guild)
             if LEAVE_UNAPPROVED:
                 try:
                     await guild.leave()
