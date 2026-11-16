@@ -689,6 +689,7 @@ class TokenPool:
         members: int | None = None,
         name: str | None = None,
         force: bool = False,
+        source: str | None = None,
     ) -> str:
         """Sticky assign token + callsign. Existing seat kept unless force=True. Returns token_id."""
         key = str(int(guild_id))
@@ -705,6 +706,9 @@ class TokenPool:
                 tid = existing["token_id"]
                 if not existing.get("callsign"):
                     self._ensure_callsign_locked(existing, tid, preferred=callsign)
+                    dirty = True
+                if source and not existing.get("source"):
+                    existing["source"] = str(source)
                     dirty = True
                 if dirty:
                     self.save()
@@ -734,6 +738,10 @@ class TokenPool:
                 "assigned_at": time.time(),
                 "members": max(0, int(members or (existing or {}).get("members") or 0)),
             }
+            if source:
+                meta["source"] = str(source)
+            elif existing and existing.get("source"):
+                meta["source"] = existing["source"]
             if name or (existing or {}).get("name"):
                 meta["name"] = name or existing.get("name")
             # Temporarily drop this guild from assignments so pick_callsign doesn't see its old seat.

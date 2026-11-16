@@ -928,6 +928,31 @@ async def restore_playback_state():
 
 WHITELIST_FILE = _state_file("user_whitelist.json")
 STAFF = tenancy.StaffDirectory(WHITELIST_FILE)
+
+
+def _bootstrap_staff_from_env() -> int:
+    """Ensure ARKEN_BOOTSTRAP_OWNERS ids are owners (adds missing ids only; persists to STATE_DIR)."""
+    raw = aenv.get("BOOTSTRAP_OWNERS", "").strip()
+    if not raw:
+        return 0
+    added = 0
+    for part in re.split(r"[\s,;]+", raw):
+        part = part.strip()
+        if not part.isdigit():
+            continue
+        uid = int(part)
+        if STAFF.is_staff(uid):
+            continue
+        try:
+            STAFF.set_role(uid, "owner")
+            added += 1
+            print(f"🛡️ Bootstrap owner added: {uid}")
+        except Exception as e:
+            print(f"⚠️ Could not bootstrap owner {uid}: {e}")
+    return added
+
+
+_bootstrap_staff_from_env()
 GUILD_REGISTRY = tenancy.GuildRegistry(_state_file("allowed_guilds.json"))
 LEAVE_UNAPPROVED = aenv.get("LEAVE_UNAPPROVED", "").strip().lower() in (
     "1", "true", "yes", "on",
@@ -1064,6 +1089,50 @@ def _guild_member_count(guild) -> int:
         return max(0, len(guild.members))
     except Exception:
         return 0
+
+
+async def _pool_claim_from_invite(guild) -> bool:
+    """Lock a guild to this OAuth bot (ARKEN_TOKEN_ID) when it joins via invite.
+
+    The Discord application used in the invite URL is the source of truth for scaling:
+    Gondor invite → gondor seat; Osgiliath invite → osgiliath. Returns False if this process left.
+    """
+    if guild is None or not TOKEN_POOL.enabled() or not TOKEN_ID:
+        return True
+    members = _guild_member_count(guild)
+    owner = TOKEN_POOL.token_of(guild.id)
+    if owner is not None and owner != TOKEN_ID:
+        city = tenancy.display_token_name(owner)
+        here = tenancy.display_token_name(TOKEN_ID)
+        print(
+            f"🛡️ {guild.name} ({guild.id}) is assigned to **{owner}** ({city}) "
+            f"but joined via **{TOKEN_ID}** ({here}) — leaving"
+        )
+        try:
+            await guild.leave()
+        except Exception as e:
+            print(f"⚠️ Could not leave {guild.name}: {e}")
+        return False
+    try:
+        TOKEN_POOL.assign(
+            guild.id,
+            token_id=TOKEN_ID,
+            members=members,
+            name=guild.name,
+            source="invite",
+        )
+        seat = TOKEN_POOL.seat_of(guild.id)
+        print(f"🛡️ Invite claim {guild.name} ({guild.id}) → {seat or TOKEN_ID}")
+        if guild_is_approved(guild.id):
+            await _sync_seat_nickname(guild)
+        return True
+    except (tenancy.PoolFullError, tenancy.CallsignExhaustedError) as e:
+        print(f"⚠️ Cannot claim {guild.name} on {TOKEN_ID}: {e}")
+        try:
+            await guild.leave()
+        except Exception:
+            pass
+        return False
 
 
 def _count_active_players() -> int:
@@ -1208,15 +1277,26 @@ def require_staff(*capabilities: str):
             uid = ctx.author.id
             if not STAFF.is_staff(uid):
                 print(f"🚫 Staff denied: {ctx.author} ({uid}) tried {getattr(ctx.command, 'name', '?')}")
-                await ctx.send("❌ **Access denied.** Arken staff only.")
+                hint = ""
+                if not STAFF.ids():
+                    hint = (
+                        " Staff list is **empty** on this instance — put owners in "
+                        f"`{WHITELIST_FILE}` or set `ARKEN_BOOTSTRAP_OWNERS` in `.env` and restart."
+                    )
+                else:
+                    hint = f" Your Discord id is `{uid}`; staff file is `{WHITELIST_FILE}`."
+                await ctx.send(f"❌ **Access denied.** Arken staff only.{hint}")
                 return
             missing = [c for c in needed if not staff_has(uid, c)]
             if missing:
                 role = staff_role(uid) or "?"
                 print(f"🚫 Capability denied ({missing}): {ctx.author} role={role}")
+                if missing == ("manage_staff",):
+                    extra = " Only **owners** can change the staff whitelist (`!whitelist`)."
+                else:
+                    extra = f" Need: {', '.join(missing)}."
                 await ctx.send(
-                    f"❌ **Access denied.** Your staff role (`{role}`) cannot do that. "
-                    f"Need: {', '.join(missing)}."
+                    f"❌ **Access denied.** Your staff role (`{role}`) cannot do that.{extra}"
                 )
                 return
             return await func(*args, **kwargs)
@@ -1307,7 +1387,13 @@ _staff_counts = ", ".join(
     f"{r}={sum(1 for m in STAFF.all().values() if m.get('role') == r)}"
     for r in tenancy.STAFF_ROLE_ORDER
 )
+print(f"🛡️ Staff file: {WHITELIST_FILE} (exists={WHITELIST_FILE.is_file()})")
 print(f"🛡️ Staff loaded: {len(STAFF.ids())} ({_staff_counts})")
+if not STAFF.ids():
+    print(
+        "⚠️ No staff in user_whitelist.json — admin commands (!guilds, !whitelist, …) will deny everyone. "
+        "Copy data/user_whitelist.json from your PC (sync_state) or set ARKEN_BOOTSTRAP_OWNERS in .env."
+    )
 print(
     "🛡️ Guild registry: "
     + (
@@ -2327,6 +2413,17 @@ async def on_ready():
         status = GUILD_REGISTRY.seen(guild.id, guild.name)
         if status != "approved":
             print(f"⚠️ Server not approved ({status}): {guild.name} ({guild.id})")
+            if TOKEN_POOL.enabled() and TOKEN_ID:
+                owner = TOKEN_POOL.token_of(guild.id)
+                if owner is not None and owner != TOKEN_ID:
+                    print(f"🛡️ {guild.name} pending but reserved for token {owner} — leaving")
+                    try:
+                        await guild.leave()
+                    except Exception:
+                        pass
+                    continue
+                if not LEAVE_UNAPPROVED:
+                    await _pool_claim_from_invite(guild)
             if LEAVE_UNAPPROVED:
                 try:
                     await guild.leave()
@@ -2335,34 +2432,12 @@ async def on_ready():
                     print(f"⚠️ Could not leave {guild.name}: {e}")
             continue
 
-        # Pool mode: claim unassigned approved guilds for this token, leave ones owned elsewhere.
         if TOKEN_POOL.enabled() and TOKEN_ID:
-            owner = TOKEN_POOL.token_of(guild.id)
-            members = _guild_member_count(guild)
-            if owner is None:
-                try:
-                    TOKEN_POOL.assign(
-                        guild.id, token_id=TOKEN_ID, members=members, name=guild.name
-                    )
-                    seat = TOKEN_POOL.seat_of(guild.id)
-                    print(f"🛡️ Claimed {guild.name} → {seat or TOKEN_ID}")
-                    await _sync_seat_nickname(guild)
-                except (tenancy.PoolFullError, tenancy.CallsignExhaustedError) as e:
-                    print(f"⚠️ Cannot claim {guild.name}: {e}")
-                    try:
-                        await guild.leave()
-                        print(f"👋 Left {guild.name} (this token is at guild cap)")
-                    except Exception as leave_err:
-                        print(f"⚠️ Could not leave {guild.name}: {leave_err}")
-            elif owner != TOKEN_ID:
-                print(f"🛡️ {guild.name} belongs to token {owner} — leaving")
-                try:
-                    await guild.leave()
-                except Exception as e:
-                    print(f"⚠️ Could not leave {guild.name}: {e}")
-            else:
-                TOKEN_POOL.update_guild_members(guild.id, members, name=guild.name)
-                await _sync_seat_nickname(guild)
+            if not await _pool_claim_from_invite(guild):
+                continue
+            TOKEN_POOL.update_guild_members(
+                guild.id, _guild_member_count(guild), name=guild.name
+            )
 
     # Check intents status
     print("\n🔍 INTENT STATUS CHECK:")
@@ -2422,43 +2497,13 @@ async def on_disconnect():
 
 @bot.event
 async def on_guild_join(guild):
-    """New invite: mark pending until an owner approves. Optionally leave immediately."""
+    """New invite: lock pool city to this bot; pending until staff approve."""
     status = GUILD_REGISTRY.seen(guild.id, guild.name)
     print(f"📥 Joined {guild.name} ({guild.id}) — status={status}")
 
-    if status == "approved" and TOKEN_POOL.enabled() and TOKEN_ID:
-        owner = TOKEN_POOL.token_of(guild.id)
-        members = _guild_member_count(guild)
-        if owner is None:
-            try:
-                TOKEN_POOL.assign(
-                    guild.id, token_id=TOKEN_ID, members=members, name=guild.name
-                )
-                seat = TOKEN_POOL.seat_of(guild.id)
-                print(f"🛡️ Claimed approved {guild.name} → {seat or TOKEN_ID}")
-                await _sync_seat_nickname(guild)
-                return
-            except (tenancy.PoolFullError, tenancy.CallsignExhaustedError):
-                print(f"⚠️ Approved {guild.name} but this token is at cap — leaving")
-                try:
-                    await guild.leave()
-                except Exception:
-                    pass
-                return
-        if owner != TOKEN_ID:
-            print(f"🛡️ {guild.name} is assigned to token {owner} — leaving")
-            try:
-                await guild.leave()
-            except Exception:
-                pass
+    if TOKEN_POOL.enabled() and TOKEN_ID:
+        if not await _pool_claim_from_invite(guild):
             return
-        TOKEN_POOL.update_guild_members(guild.id, members, name=guild.name)
-        await _sync_seat_nickname(guild)
-        return
-
-    if status == "approved":
-        await _sync_seat_nickname(guild)
-        return
     notice = (
         f"Arken joined **{guild.name}** but this server is **{status}**. "
         f"An owner must run `!allowguild {guild.id}` before music works here."
@@ -4762,13 +4807,16 @@ def _build_command_guide_embed(member: discord.Member) -> discord.Embed:
 
     role = staff_role(member.id)
     if role:
+        staff_lines = [
+            "**Guilds:** `!guilds` · `!allowguild` · `!leaveguild` · `!tokens`",
+            "**Ops:** `!reboot` · `!deps` · `!rejoin`",
+            "**Debug:** `!diagnose` · `!nettest` · `!region` · `!test`",
+        ]
+        if role == "owner":
+            staff_lines.insert(1, "**Staff (owners only):** `!whitelist` — add/remove staff")
         embed.add_field(
             name=f"Staff ({role})",
-            value=(
-                "**Guilds:** `!guilds` · `!allowguild` · `!leaveguild` · `!tokens`\n"
-                "**Ops:** `!whitelist` · `!reboot` · `!deps` · `!rejoin`\n"
-                "**Debug:** `!diagnose` · `!nettest` · `!region` · `!test`"
-            ),
+            value="\n".join(staff_lines),
             inline=False,
         )
 
@@ -5678,10 +5726,13 @@ def _split_user_and_role(text: str):
     return text, None
 
 
-@bot.command(name="whitelist", help="Manage Arken staff roles: !whitelist [add|remove|check|set] …")
-@require_staff("manage_staff")
+@bot.command(
+    name="whitelist",
+    help="Manage global staff — owners only: !whitelist [add|remove|check|set] …",
+)
+@require_owner()
 async def whitelist_cmd(ctx, action=None, *, user_input=None):
-    """Global staff directory — not per-server DJs. Roles: owner, operator."""
+    """Global staff directory — not per-server DJs. Only owners may change this list."""
 
     if not action:
         staff = STAFF.all()
@@ -5709,10 +5760,10 @@ async def whitelist_cmd(ctx, action=None, *, user_input=None):
         else:
             embed.add_field(name="Members", value="No staff yet.", inline=False)
         embed.add_field(
-            name="Commands",
+            name="Commands (owners only)",
             value=(
-                "`!whitelist add <user> [owner|operator]` — default owner\n"
-                "`!whitelist set <user> <role>` — change role\n"
+                "`!whitelist add <user>` — add as **operator** (default)\n"
+                "`!whitelist set <user> <owner|operator>` — change role\n"
                 "`!whitelist remove <user>` · `!whitelist check <user>`"
             ),
             inline=False,
@@ -5727,7 +5778,16 @@ async def whitelist_cmd(ctx, action=None, *, user_input=None):
 
     if action in ("add", "set"):
         user_token, role = _split_user_and_role(user_input)
-        role = role or ("owner" if action == "add" else None)
+        if action == "add":
+            role = role or "operator"
+            if role == "owner":
+                await ctx.send(
+                    "❌ New staff are added as **operator** by default. "
+                    "Use `!whitelist set <user> owner` to promote someone."
+                )
+                return
+        else:
+            role = role or None
         if action == "set" and not role:
             await ctx.send("❌ Usage: `!whitelist set <user> <owner|operator>`")
             return
@@ -5810,7 +5870,7 @@ async def guilds_cmd(ctx):
         description="\n".join(rows) if rows else "No servers recorded yet.",
         color=0x00bcd4,
     )
-    footer = "!allowguild <id> · !leaveguild <id> [--purge]"
+    footer = "!allowguild <id> (this city) · --auto · !leaveguild <id> [--purge]"
     if TOKEN_POOL.enabled():
         footer += " · !tokens"
     embed.set_footer(text=footer)
@@ -5864,51 +5924,106 @@ async def tokens_cmd(ctx):
     await ctx.send(embed=embed)
 
 
-@bot.command(name="allowguild", aliases=["approveguild"], help="Approve a Discord server (staff: manage_guilds)")
+def _parse_allowguild_flags(note: str | None) -> tuple[str | None, bool, str | None]:
+    """Return (clean_note, auto_balance, force_token) from optional note/flags tail."""
+    if not note:
+        return None, False, None
+    text = note.strip()
+    auto = bool(re.search(r"(?:^|\s)--(?:auto|balance)\b", text, re.I))
+    force_token = None
+    m = re.search(r"(?:^|\s)--token\s+([a-z0-9_-]+)", text, re.I)
+    if m:
+        force_token = m.group(1).lower()
+    clean = re.sub(r"(?:^|\s)--(?:auto|balance)\b", "", text, flags=re.I)
+    clean = re.sub(r"(?:^|\s)--token\s+[a-z0-9_-]+", "", clean, flags=re.I).strip()
+    return (clean or None), auto, force_token
+
+
+@bot.command(
+    name="allowguild",
+    aliases=["approveguild"],
+    help="Approve a server; pool city locks when that city's bot joins (or use --auto/--token)",
+)
 @require_staff("manage_guilds")
 async def allowguild_cmd(ctx, guild_id: str = None, *, note: str = None):
     if not guild_id or not guild_id.isdigit():
-        await ctx.send("❌ Usage: `!allowguild <server_id> [note]`")
+        await ctx.send(
+            "❌ Usage: `!allowguild <server_id> [note]`\n"
+            "**Default:** approve only — invite a city bot; `source=invite` locks the token.\n"
+            "`!allowguild <id> --auto` — balance before invite. "
+            "`!allowguild <id> --token osgiliath` — reserve a city before invite."
+        )
         return
     gid = int(guild_id)
     g = bot.get_guild(gid)
     members = _guild_member_count(g) if g else 0
-    assigned = None
-    seat = None
+    reg_note, auto_balance, force_token = _parse_allowguild_flags(note)
+    assigned = TOKEN_POOL.token_of(gid) if TOKEN_POOL.enabled() else None
+    seat = TOKEN_POOL.seat_of(gid) if TOKEN_POOL.enabled() else None
     if TOKEN_POOL.enabled():
         try:
-            assigned = TOKEN_POOL.assign(
-                gid,
+            assign_kw = dict(
                 members=members or None,
                 name=g.name if g else None,
             )
-            seat = TOKEN_POOL.seat_of(gid)
+            if auto_balance:
+                assigned = TOKEN_POOL.assign(gid, source="balance", **assign_kw)
+                seat = TOKEN_POOL.seat_of(gid)
+            elif force_token:
+                if assigned and assigned != force_token:
+                    await ctx.send(
+                        f"❌ Server already locked to **{tenancy.display_token_name(assigned)}** "
+                        f"(via invite). Use `!leaveguild {gid} --purge` first."
+                    )
+                    return
+                assigned = TOKEN_POOL.assign(
+                    gid, token_id=force_token, source="staff", **assign_kw
+                )
+                seat = TOKEN_POOL.seat_of(gid)
+            elif g is not None and TOKEN_ID and guild_served_here(gid):
+                assigned = TOKEN_POOL.assign(
+                    gid, token_id=TOKEN_ID, source="staff", **assign_kw
+                )
+                seat = TOKEN_POOL.seat_of(gid)
+            elif assigned:
+                seat = TOKEN_POOL.seat_of(gid)
+            # else: approve only; wait for invite join to call _pool_claim_from_invite
         except tenancy.PoolFullError as e:
             await ctx.send(f"❌ Cannot approve — token pool is full: {e}")
             return
         except tenancy.CallsignExhaustedError as e:
             await ctx.send(f"❌ Cannot approve — no free callsign on that token: {e}")
             return
-    GUILD_REGISTRY.approve(gid, name=g.name if g else None, note=note)
+        except ValueError as e:
+            await ctx.send(f"❌ {e}")
+            return
+    GUILD_REGISTRY.approve(gid, name=g.name if g else None, note=reg_note)
     if g is not None and seat and guild_served_here(gid):
         await _sync_seat_nickname(g)
     msg = f"✅ Approved server `{gid}`" + (f" (**{g.name}**)" if g else "") + "."
     if seat:
         msg += (
-            f" Seat **{seat}** — members will see the bot as **{seat}** "
+            f" Seat **{seat}** — members see **{seat}** "
             f"in that server (per-server nickname)."
         )
     elif assigned:
-        msg += f" Assigned to token `{assigned}`."
-    if assigned:
-        if TOKEN_ID and assigned != TOKEN_ID:
-            city = tenancy.display_token_name(assigned)
+        msg += f" Reserved for **{tenancy.display_token_name(assigned)}** (`{assigned}`)."
+    if TOKEN_POOL.enabled():
+        if assigned and TOKEN_ID and assigned != TOKEN_ID:
             msg += (
-                f" Invite the **{city}** bot into the server "
-                f"(this instance is **{tenancy.display_token_name(TOKEN_ID)}** and will not serve it)."
+                f" Invite the **{tenancy.display_token_name(assigned)}** bot "
+                f"(not **{tenancy.display_token_name(TOKEN_ID)}**)."
             )
-        elif g is None:
-            msg += " Invite the assigned bot into the server if it is not already there."
+        elif not assigned:
+            msg += (
+                " Invite a **city** bot from the developer portal — "
+                "the pool locks to whichever bot joins first."
+            )
+        elif g is None and assigned and not auto_balance and not force_token:
+            msg += (
+                f" When **{tenancy.display_token_name(assigned)}** joins, "
+                f"it will claim this seat."
+            )
     await ctx.send(msg)
 
 

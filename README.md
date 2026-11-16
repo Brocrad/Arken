@@ -84,7 +84,7 @@ To spread guilds across several Discord bot applications (rate-limit / CPU headr
 1. Create the bot apps in the Discord developer portal (tokens are not minted by Arken).
 2. Set `ARKEN_TOKEN_POOL=gondor,osgiliath,nimloth,morthond` and `ARKEN_MAX_GUILDS_PER_TOKEN=5` in `.env`.
 3. Run one process/container per **city-token** with `ARKEN_TOKEN_ID` + that bot’s `NEW_DISCORD_TOKEN` (see `docker-compose.pool.yml`).
-4. `!allowguild` auto-assigns the least-loaded token **and** the next free callsign seat (e.g. **Osgiliath · East Bank**). Sticky until `!leaveguild`. Use `!tokens` / `!guilds` to inspect.
+4. **Token = which Discord app joined** (`source: invite` in `token_pool.json`). `!allowguild` only approves unless you pass `--auto` (balance first) or `--token city`. Sticky until `!leaveguild`. Use `!tokens` / `!guilds` to inspect.
 
 Playlists/likes/settings stay isolated by Discord guild id — seats are support labels only. Prometheus textfiles land in `data/metrics/` (`ARKEN_METRICS=0` disables).
 
