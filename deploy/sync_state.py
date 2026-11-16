@@ -219,12 +219,30 @@ if [ ! -d "$REMOTE_DIR" ]; then
 fi
 cd "$REMOTE_DIR"
 
+# --- preflight: fail before touching anything ---
+mkdir -p data/playlists 2>/dev/null || true
+BAD=$(find data ! -writable 2>/dev/null | head -5)
+if [ ! -d data ]; then BAD="$REMOTE_DIR"; fi
+if [ -n "$BAD" ]; then
+  echo "remote: no write permission here (as user $(id -un)):" >&2
+  echo "$BAD" | sed 's/^/          /' >&2
+  echo "remote: usually docker created data/ as root. Fix with:" >&2
+  echo "          sudo docker compose stop; sudo chown -R $(id -un):$(id -gn) $REMOTE_DIR" >&2
+  exit 3
+fi
+
 DC=""
 if command -v docker >/dev/null 2>&1; then
   if docker compose version >/dev/null 2>&1; then DC="docker compose"
   elif command -v docker-compose >/dev/null 2>&1; then DC="docker-compose"; fi
 fi
-if [ -n "$DC" ] && [ -f docker-compose.yml ]; then
+if [ "$RESTART" = 1 ] && [ -n "$DC" ] && ! docker info >/dev/null 2>&1; then
+  echo "remote: this user cannot talk to Docker (not in the 'docker' group?). Nothing was changed." >&2
+  echo "          sudo usermod -aG docker $(id -un)   # then log out and back in" >&2
+  echo "        or: sudo docker compose stop  (on the server), rerun with --no-restart, then sudo docker compose up -d." >&2
+  exit 4
+fi
+if [ -n "$DC" ] && [ "$RESTART" = 1 ] && [ -f docker-compose.yml ]; then
   echo "remote: stopping gondor"
   $DC stop || true
 fi
