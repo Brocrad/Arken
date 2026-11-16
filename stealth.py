@@ -11,6 +11,14 @@ import time
 import signal
 from pathlib import Path
 
+# Windows default console encoding (e.g. cp1252) cannot encode emoji in print().
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 class AudioSystemManager:
     def __init__(self):
         self.processor_process = None
@@ -230,7 +238,11 @@ class AudioSystemManager:
                 if self.bot_process and self.bot_process.poll() is not None:
                     exit_code = self.bot_process.returncode
                     self.log_with_timestamp(f"❌ Discord bot died (exit code: {exit_code})")
-                    
+
+                    if exit_code in (0, 3):
+                        self.log_with_timestamp("   Clean exit or duplicate-instance guard — not auto-restarting.")
+                        break
+
                     if self.auto_restart_enabled:
                         if not self.restart_discord_bot():
                             self.log_with_timestamp("❌ Failed to restart Discord bot")

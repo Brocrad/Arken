@@ -4,9 +4,6 @@ Discord Audio Streaming Bot
 A lightweight bot for streaming audio files to Discord voice channels
 """
 
-import discord
-from discord.ext import commands
-import asyncio
 import os
 import sys
 import json
@@ -16,14 +13,24 @@ import time
 import uuid
 import requests
 import shutil
+import re
+import random
+import threading
+import asyncio
+import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load .env before discord so GONDOR_* affects the voice stack.
 try:
     load_dotenv()
-except:
+except Exception:
     print("WARNING: Skipping .env file due to encoding issues")
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
 
 # Windows default console encoding (e.g. cp1252) cannot encode emoji in print(); fix before any emoji output.
 if sys.platform == "win32":
@@ -33,11 +40,69 @@ if sys.platform == "win32":
         except Exception:
             pass
 
+import discord
+from discord.ext import commands
+
+import io
+import vapor_style as vapor  # vaporwave/breakcore status text
+import donut  # spinning ASCII donut shown while summoning (text fallback)
+import gif_art  # animated GIF badges + summon donut (pure stdlib, generated locally)
+import math
+from array import array
+from collections import deque, OrderedDict
+from types import SimpleNamespace
+
+import gondor_extras as extras  # effects, sleep timer, stats, likes, lyrics, game helpers (pure logic)
+try:
+    import audioop  # volume maths for fades (discord.py needs it for volume anyway)
+except ImportError:  # pragma: no cover
+    audioop = None
+
+# Optional: force IDENTIFY max_dave=0 (classic modes only). Do NOT enable by default — many guilds require DAVE;
+# a mismatch causes Discord to drop voice while discord.py reconnects → join/leave loop. Set explicitly in .env if needed.
+_use_dave = _env_truthy("GONDOR_VOICE_USE_DAVE")
+_no_dave = _env_truthy("GONDOR_VOICE_NO_DAVE")
+if _no_dave and not _use_dave:
+
+    def _gondor_legacy_max_dave_protocol_version(_self) -> int:
+        return 0
+
+    discord.voice_state.VoiceConnectionState.max_dave_protocol_version = property(
+        _gondor_legacy_max_dave_protocol_version
+    )
+    print(
+        "🔧 GONDOR_VOICE_NO_DAVE: voice IDENTIFY uses max_dave=0. "
+        "If the bot joins/leaves in a loop, remove this from .env."
+    )
+
 # Audio streaming utilities
 
+_LEGACY_FFMPEG = r"C:\Users\Jasper\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Essentials_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0-essentials_build\bin\ffmpeg.exe"
+_ffmpeg_cached = None
+
+
 def get_ffmpeg_path():
-    """Get the full path to FFmpeg executable"""
-    return r"C:\Users\Jasper\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Essentials_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0-essentials_build\bin\ffmpeg.exe"
+    """Locate FFmpeg portably: GONDOR_FFMPEG env var -> PATH -> a winget install -> legacy path."""
+    global _ffmpeg_cached
+    if _ffmpeg_cached:
+        return _ffmpeg_cached
+    found = None
+    env = os.environ.get("GONDOR_FFMPEG", "").strip().strip('"')
+    if env and os.path.isfile(env):
+        found = env
+    if not found:
+        found = shutil.which("ffmpeg")
+    if not found:
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            import glob as _glob
+            hits = sorted(_glob.glob(os.path.join(local, "Microsoft", "WinGet", "Packages", "*FFmpeg*", "**", "bin", "ffmpeg.exe"), recursive=True))
+            if hits:
+                found = hits[-1]
+    if not found and os.path.isfile(_LEGACY_FFMPEG):
+        found = _LEGACY_FFMPEG
+    _ffmpeg_cached = found or "ffmpeg"
+    return _ffmpeg_cached
 
 # FFmpeg options for audio playback - Optimized for Discord and AAC files
 ffmpeg_options = {
@@ -62,10 +127,21 @@ print(f"   guilds: {intents.guilds}")
 
 bot = commands.Bot(command_prefix='!', intents=intents, description="File streaming utility")
 
+if os.environ.get("GONDOR_VOICE_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"):
+    logging.basicConfig(level=logging.DEBUG)
+    logging.getLogger("discord.voice_state").setLevel(logging.DEBUG)
+    logging.getLogger("discord.gateway").setLevel(logging.DEBUG)
+    print("🔧 GONDOR_VOICE_DEBUG: verbose discord voice logging enabled")
+
+print(f"🔧 discord.py version: {discord.__version__}")
+if not _env_truthy("GONDOR_VOICE_RECONNECT"):
+    print("🔧 Voice: auto-reconnect after errors is OFF (stops 4006 loops). Set GONDOR_VOICE_RECONNECT=1 to restore.")
+
 # Directories for communication with background service
 MEDIA_DIR = Path("media_library")
 QUEUE_DIR = Path("request_queue")
 MEDIA_DIR.mkdir(exist_ok=True)
+MEDIA_EXTS = (".webm", ".m4a", ".mp4", ".opus", ".mp3", ".ogg")
 QUEUE_DIR.mkdir(exist_ok=True)
 
 # Background audio processor (audio_processor_service.py) — spawned automatically unless already running
@@ -97,6 +173,116 @@ def _pid_exists(pid: int) -> bool:
         return False
 
 
+def _sanitize_user_query(q: str) -> str:
+    """Strip invisible Unicode that breaks Windows / yt-dlp (e.g. ZWSP after !play)."""
+    if not q:
+        return q
+    for ch in (
+        "\u200b",
+        "\u200c",
+        "\u200d",
+        "\ufeff",
+        "\u2060",
+        "\u202a",
+        "\u202b",
+        "\u202c",
+        "\u202d",
+        "\u202e",
+    ):
+        q = q.replace(ch, "")
+    return q.strip()
+
+
+VOICE_LATENCY_GRACE = 30.0  # seconds after a join during which "no heartbeat yet" is normal
+
+
+def _mark_voice_joined(vc) -> None:
+    """Remember when we joined: discord.py reports latency=inf until the first voice heartbeat is acked."""
+    try:
+        vc._gondor_joined_at = time.monotonic()
+    except Exception:
+        pass
+
+
+def _voice_session_usable(vc: discord.VoiceClient | None) -> bool:
+    """True only if voice socket looks live (avoids 'connected' after 4006)."""
+    if vc is None or not vc.is_connected():
+        return False
+    try:
+        if vc.latency != float("inf"):
+            return True
+    except Exception:
+        return True
+    # Connected but no heartbeat ack yet. Right after joining that is normal (the first voice
+    # heartbeat can take ~10+ s), so don't report a healthy fresh join as broken.
+    joined = getattr(vc, "_gondor_joined_at", None)
+    return joined is not None and (time.monotonic() - joined) < VOICE_LATENCY_GRACE
+
+
+def _ensure_single_streaming_instance() -> None:
+    """Exclusive lock — two streaming.py processes cause 4006 + duplicate Discord messages."""
+    if _env_truthy("GONDOR_ALLOW_MULTI_INSTANCE"):
+        return
+    lock_path = _project_root() / ".gondor_streaming.lock"
+    pid_bytes = str(os.getpid()).encode("ascii")
+
+    def try_create_lock() -> bool:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, pid_bytes)
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            return False
+
+    if try_create_lock():
+        def release() -> None:
+            try:
+                if not lock_path.is_file():
+                    return
+                cur = lock_path.read_text(encoding="ascii", errors="ignore").strip()
+                if cur == str(os.getpid()):
+                    lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        atexit.register(release)
+        return
+
+    try:
+        raw = lock_path.read_text(encoding="ascii", errors="ignore").strip()
+        old = int(raw) if raw else 0
+        if old and _pid_exists(old):
+            print("❌ Another streaming.py is already running (same folder).")
+            print("   Two bots on one token → voice 4006 and duplicate replies. Close the other process.")
+            print(f"   Locked by PID {old}. Remove {lock_path.name} only if that process is dead.")
+            sys.exit(3)
+    except (ValueError, OSError):
+        pass
+
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    if not try_create_lock():
+        print(f"❌ Could not create {lock_path.name}. Exit.")
+        sys.exit(3)
+
+    def release2() -> None:
+        try:
+            if lock_path.is_file():
+                cur = lock_path.read_text(encoding="ascii", errors="ignore").strip()
+                if cur == str(os.getpid()):
+                    lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    atexit.register(release2)
+
+
 def _audio_processor_already_running() -> bool:
     pid_file = _project_root() / "request_queue" / ".audio_processor.pid"
     if not pid_file.exists():
@@ -107,14 +293,43 @@ def _audio_processor_already_running() -> bool:
         return False
 
 
+def _kill_audio_processor_from_pidfile() -> None:
+    pid_file = _project_root() / "request_queue" / ".audio_processor.pid"
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (ValueError, OSError):
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True, timeout=15)
+        else:
+            os.kill(pid, 15)
+    except Exception as e:
+        print(f"⚠️ Could not stop old audio processor (PID {pid}): {e}")
+    time.sleep(1.0)
+    try:
+        pid_file.unlink()
+    except OSError:
+        pass
+
+
 def _ensure_audio_processor_subprocess() -> None:
     """Start queue consumer unless GONDOR_SKIP_AUDIO_PROCESSOR=1 or another instance is alive."""
     if os.environ.get("GONDOR_SKIP_AUDIO_PROCESSOR", "").strip() in ("1", "true", "yes"):
         print("⚠️ Skipping audio processor spawn (GONDOR_SKIP_AUDIO_PROCESSOR)")
         return
     if _audio_processor_already_running():
-        print("🎵 Audio processor already running (shared queue)")
-        return
+        pid_file = _project_root() / "request_queue" / ".audio_processor.pid"
+        try:
+            just_started = (time.time() - pid_file.stat().st_mtime) < 15
+        except OSError:
+            just_started = False
+        if just_started or _processor_heartbeat_age() < 15:
+            print("🎵 Audio processor already running (shared queue)")
+            return
+        # Alive but silent: an older build without the heartbeat, or hung
+        print("♻️ Audio processor has no heartbeat (old version or hung) — restarting it")
+        _kill_audio_processor_from_pidfile()
     global _audio_processor_child
     script = _project_root() / "audio_processor_service.py"
     print("🎵 Starting background audio processor...")
@@ -162,6 +377,11 @@ playlist_queues = {}  # {guild_id: {"playlist_name": str, "songs": list, "origin
 song_queues = {}  # {guild_id: [{"title": str, "file_path": str, "duration": int, "requested_by": User, "cached": bool}, ...]}
 # Next after_playing() after voice_client.stop() must continue the playlist (not !play song_queues)
 playlist_force_after_stop = set()
+# play_next_playlist_song stops the current track itself: that stop's after_playing must not advance again
+suppress_after_playing = set()
+# guilds currently inside play_next_playlist_song (drops duplicate concurrent advances)
+_playlist_advancing = set()
+_playlist_advance_pending = set()
 notification_channels = {}  # {guild_id: channel} - tracks where to send music notifications
 
 # Voice channel state management
@@ -171,6 +391,12 @@ PLAYBACK_STATE_FILE = Path("playback_state.json")
 def set_notification_channel(guild_id, channel):
     """Set the notification channel for a guild"""
     notification_channels[guild_id] = channel
+    try:
+        cid = getattr(channel, "id", None)
+        if cid and guild_setting(guild_id, "notify_channel") != cid:
+            set_guild_setting(guild_id, "notify_channel", cid)
+    except NameError:
+        pass  # settings helpers aren't defined yet (very early call)
 
 def get_notification_channel(guild_id):
     """Get the notification channel for a guild"""
@@ -233,6 +459,88 @@ def clear_voice_state():
     except Exception as e:
         print(f"⚠️ Error clearing voice state: {e}")
 
+_voice_connect_locks: dict[int, asyncio.Lock] = {}
+
+
+def _voice_connect_lock(guild_id: int) -> asyncio.Lock:
+    lock = _voice_connect_locks.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _voice_connect_locks[guild_id] = lock
+    return lock
+
+
+async def _await_voice_connected(voice_client: discord.VoiceClient, timeout: float) -> bool:
+    """Poll until connected — avoids VoiceClient.wait_until_connected() (threading wait blocks the event loop)."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if voice_client.is_connected():
+            return True
+        await asyncio.sleep(0.05)
+    return voice_client.is_connected()
+
+
+async def connect_to_voice_channel(
+    guild: discord.Guild,
+    channel: discord.VoiceChannel | discord.StageChannel,
+    *,
+    timeout: float = 30.0,
+) -> discord.VoiceClient:
+    """
+    One serialized voice join per guild: move_to when possible, otherwise force-disconnect
+    and reconnect. Reduces stale sessions / voice WebSocket 4006 from overlapping handshakes
+    (e.g. !summon racing with on_ready rejoin).
+    """
+    async with _voice_connect_lock(guild.id):
+        vc = guild.voice_client
+
+        if vc is not None:
+            same_ch = vc.channel == channel
+            if same_ch and _voice_session_usable(vc):
+                return vc
+
+            if _voice_session_usable(vc) and not same_ch:
+                try:
+                    await asyncio.wait_for(vc.move_to(channel), timeout=timeout)
+                    moved = guild.voice_client
+                    if moved and await _await_voice_connected(moved, min(timeout, 20.0)):
+                        _mark_voice_joined(moved)
+                        return moved
+                except Exception as e:
+                    print(f"⚠️ move_to failed: {type(e).__name__}: {e}")
+
+            try:
+                vc.stop()
+            except Exception:
+                pass
+            try:
+                await vc.disconnect(force=True)
+            except Exception as e:
+                print(f"⚠️ voice disconnect(force=True): {e}")
+            await asyncio.sleep(1.0)
+
+        connect_timeout = min(max(timeout, 10.0), 90.0)
+        voice_reconnect = _env_truthy("GONDOR_VOICE_RECONNECT")
+        new_vc = await asyncio.wait_for(
+            channel.connect(
+                timeout=connect_timeout,
+                reconnect=voice_reconnect,
+                self_deaf=False,
+                self_mute=False,
+            ),
+            timeout=connect_timeout + 20.0,
+        )
+        if not await _await_voice_connected(new_vc, min(timeout, 30.0)):
+            try:
+                await new_vc.disconnect(force=True)
+            except Exception:
+                pass
+            raise discord.ClientException(
+                "Voice connection did not reach a stable connected state in time."
+            )
+        _mark_voice_joined(new_vc)
+        return new_vc
+
 async def rejoin_voice_channels():
     """Rejoin voice channels after restart"""
     voice_state = load_voice_state()
@@ -252,16 +560,15 @@ async def rejoin_voice_channels():
                 print(f"⚠️ Guild {state['guild_name']} not found, skipping")
                 continue
             
-            # Check if already connected
-            if guild.voice_client:
-                print(f"✅ Already connected to voice in {guild.name}")
-                continue
-            
             # Find the voice channel
             channel = guild.get_channel(state['channel_id'])
             
             if not channel:
                 print(f"⚠️ Voice channel {state['channel_name']} not found in {guild.name}")
+                continue
+
+            if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+                print(f"⚠️ Channel {channel} is not a voice/stage channel in {guild.name}")
                 continue
             
             # Check permissions
@@ -269,8 +576,7 @@ async def rejoin_voice_channels():
                 print(f"❌ No permission to connect to {channel.name} in {guild.name}")
                 continue
             
-            # Connect to voice channel
-            await channel.connect()
+            await connect_to_voice_channel(guild, channel, timeout=60.0)
             print(f"🔊 Rejoined voice channel: {channel.name} in {guild.name}")
             rejoined_count += 1
             
@@ -457,18 +763,14 @@ async def restore_playback_state():
             if state.get('playlist_state'):
                 playlist_queues[guild_id] = state['playlist_state']
                 print(f"🎵 Restored playlist state")
+                _restore_stream_session(guild_id)
             
             # Create audio source and resume playback
             try:
                 file_path = current_song['file_path']
-                source = discord.FFmpegPCMAudio(file_path, executable=get_ffmpeg_path(), **ffmpeg_options)
-                
-                audio_source = SimpleAudioSource(
-                    source,
-                    title=current_song['title'],
-                    duration=current_song.get('duration', 0),
-                    file_path=file_path
-                )
+                audio_source = make_audio_source(guild_id, file_path, title=current_song['title'],
+                                                 duration=current_song.get('duration', 0),
+                                                 video_id=current_song.get('video_id'))
                 
                 current_sources[guild_id] = audio_source
                 
@@ -599,32 +901,157 @@ def require_authorization():
 authorized_users = load_whitelist()
 print(f"🛡️ Whitelist loaded: {len(authorized_users)} authorized users")
 
+def _env_flag(name, default="1"):
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+
+NP_REACTIVE = _env_flag("GONDOR_NP_REACTIVE")  # equalizer bars follow the real audio spectrum
+_SPECTRUM_FRAMES = 3                            # 3 x 20ms of audio per analysis
+_SAMPLE_RATE = 48000
+_FFT_N = 2048
+_HANN = {}
+_TWIDDLES = {}
+
+
+def _hann(n):
+    w = _HANN.get(n)
+    if w is None:
+        w = _HANN[n] = [0.5 - 0.5 * math.cos(2 * math.pi * i / (n - 1)) for i in range(n)]
+    return w
+
+
+def _fft(a):
+    """In-place radix-2 FFT of a power-of-two list of complex numbers (pure Python, ~10ms for 2048)."""
+    n = len(a)
+    tw = _TWIDDLES.get(n)
+    if tw is None:
+        tw = _TWIDDLES[n] = [complex(math.cos(-2 * math.pi * k / n), math.sin(-2 * math.pi * k / n)) for k in range(n // 2)]
+    j = 0
+    for i in range(1, n):
+        bit = n >> 1
+        while j & bit:
+            j ^= bit
+            bit >>= 1
+        j ^= bit
+        if i < j:
+            a[i], a[j] = a[j], a[i]
+    length = 2
+    while length <= n:
+        half = length >> 1
+        step = n // length
+        for start in range(0, n, length):
+            for k in range(half):
+                u = a[start + k]
+                v = a[start + k + half] * tw[k * step]
+                a[start + k] = u + v
+                a[start + k + half] = u - v
+        length <<= 1
+
+
 class SimpleAudioSource(discord.PCMVolumeTransformer):
     """Simple audio source that just streams local files"""
-    def __init__(self, source, *, title="Unknown", duration=0, file_path=None):
-        super().__init__(source, volume=0.8)
+    def __init__(self, source, *, title="Unknown", duration=0, file_path=None, start_offset=0.0, volume=None,
+                 speed=1.0, requester=None, video_id=None, fade=0.0, game=False):
+        super().__init__(source, volume=0.8 if volume is None else volume)
         self.title = title
+        self.speed = float(speed or 1.0)    # playback speed from the sound effect (1.0 = normal)
+        self.requester = requester          # display name of whoever asked for the track
+        self.video_id = video_id
+        self.fade = float(fade or 0.0)      # seconds of fade in/out at the track's start and end
+        self.master = 1.0                   # extra gain (the sleep timer fades this to 0)
+        self.game = bool(game)              # a guess-the-song clip: hidden from presence, stats and autoplay
         self.duration = duration
         self.file_path = file_path  # Track the file path for cleanup
+        self.start_offset = float(start_offset or 0.0)  # where in the file this source began (after a seek)
+        self._frames_read = 0
+        self._tail = deque(maxlen=_SPECTRUM_FRAMES) if NP_REACTIVE else None  # last few PCM frames
+        self._peak_db = None
 
-def queue_cleanup_request(file_path):
-    """Signal background service to clean up a specific file"""
+    def read(self):
+        data = super().read()
+        if data:
+            self._frames_read += 1
+            if audioop is not None and (self.fade > 0 or self.master < 1.0):
+                gain = self.master
+                if self.fade > 0:
+                    played = None if self.start_offset > 0 else self._frames_read * 0.02
+                    remaining = max(0.0, (self.duration - self.elapsed) / self.speed) if self.duration else None
+                    gain *= extras.fade_gain(played, remaining, self.fade)
+                if gain < 0.999:
+                    data = audioop.mul(data, 2, max(0.0, gain))
+            if self._tail is not None:
+                self._tail.append(data)
+        return data
+
+    @property
+    def elapsed(self) -> float:
+        """Position in the track (seconds): where this source started + audio actually played. The voice
+        client pulls one 20ms frame per tick and stops pulling while paused, so this stays correct across
+        pauses (and counts no buffering)."""
+        return self.start_offset + self._frames_read * 0.02 * self.speed
+
+    def spectrum(self, bands=14, f_lo=50.0, f_hi=12000.0):
+        """
+        Levels (0..1, one per log-spaced band) of the audio that was just played, or None if unknown.
+        FFT over the last ~43ms, volume-compensated, with slow auto-gain so quiet and loud songs both
+        use the full height.
+        """
+        if self._tail is None:
+            return None
+        try:
+            frames = tuple(self._tail)
+            if len(frames) < _SPECTRUM_FRAMES:
+                return None
+            raw = array("h")
+            raw.frombytes(b"".join(frames))
+            if sys.byteorder != "little":
+                raw.byteswap()
+            left, right = raw[0::2], raw[1::2]
+            if len(left) < _FFT_N:
+                return None
+            lo = len(left) - _FFT_N
+            win = _hann(_FFT_N)
+            x = [complex((a + b) * 0.5 * w) for a, b, w in zip(left[lo:], right[lo:], win)]
+            _fft(x)
+            vol = max(self.volume, 0.05)
+            bin_hz = _SAMPLE_RATE / _FFT_N
+            edge = (f_hi / f_lo) ** (1.0 / bands)
+            dbs = []
+            for k in range(bands):
+                b0 = max(1, int(f_lo * edge ** k / bin_hz))
+                b1 = max(b0 + 1, int(f_lo * edge ** (k + 1) / bin_hz))
+                peak_mag = max(abs(x[b]) for b in range(b0, min(b1, _FFT_N // 2)))
+                mag = 4.0 * peak_mag / _FFT_N / vol  # ~ sample amplitude of the strongest tone in the band
+                dbs.append(20.0 * math.log10(mag + 1e-9) + 1.2 * k)  # +tilt: music has far less energy up high
+            top = max(dbs)
+            if top < -20.0:  # digital silence
+                return [0.0] * bands
+            peak = top if self._peak_db is None else max(top, self._peak_db - 1.5)
+            self._peak_db = peak
+            span = 34.0
+            return [max(0.0, min(1.0, (d - (peak - span)) / span)) for d in dbs]
+        except Exception:
+            return None
+
+def queue_cleanup_request(file_path, keep_recent=True):
+    """Signal background service to clean up a specific file.
+    keep_recent=True parks it in the processor's small replay cache (instant replays / 'previous')
+    before it is deleted; False deletes it immediately."""
     try:
         cleanup_id = str(uuid.uuid4())[:8]
-        
+
         cleanup_request = {
             'type': 'cleanup',
             'file_path': file_path,
             'cleanup_id': cleanup_id,
-            'timestamp': time.time()
+            'timestamp': time.time(),
+            'keep_recent': keep_recent,
         }
-        
-        cleanup_file = QUEUE_DIR / f"cleanup_{cleanup_id}.json"
-        with open(cleanup_file, 'w') as f:
-            json.dump(cleanup_request, f, indent=2)
-        
+
+        _write_json_atomic(QUEUE_DIR / f"cleanup_{cleanup_id}.json", cleanup_request)
+
         print(f"🧹 Queued cleanup for: {os.path.basename(file_path)}")
-        
+
     except Exception as e:
         print(f"⚠️ Failed to queue cleanup: {e}")
 
@@ -674,14 +1101,10 @@ async def play_next_queued_song(guild_id):
     try:
         # Create audio source
         audio_path = str(next_song['file_path']).replace('\\', '/')
-        source = discord.FFmpegPCMAudio(audio_path, executable=get_ffmpeg_path(), **ffmpeg_options)
-        
-        audio_source = SimpleAudioSource(
-            source, 
-            title=next_song['title'],
-            duration=next_song['duration'],
-            file_path=next_song['file_path']
-        )
+        audio_source = make_audio_source(guild_id, next_song['file_path'], title=next_song['title'],
+                                         duration=next_song['duration'],
+                                         requester=_who(next_song.get('requested_by')),
+                                         video_id=next_song.get('video_id'))
         
         current_sources[guild_id] = audio_source
         
@@ -693,8 +1116,7 @@ async def play_next_queued_song(guild_id):
         notification_channel = get_notification_channel(guild_id)
         if notification_channel:
             embed = discord.Embed(
-                title="🎵 Now Playing (from queue)",
-                description=f"**{next_song['title']}**",
+                title=vapor.title("now playing from queue"),
                 color=0x9c27b0
             )
             embed.add_field(
@@ -716,8 +1138,10 @@ async def play_next_queued_song(guild_id):
                 embed.set_footer(text=f"{remaining} songs remaining in queue")
             
             try:
-                await notification_channel.send(embed=embed)
-            except:
+                await send_now_playing(notification_channel, embed, audio_source, guild_id,
+                                       next_song['title'], next_song['duration'],
+                                       cover_path=next_song.get('cover_path'))
+            except Exception:
                 print(f"⚠️ Could not send notification to channel {notification_channel.name}")
             
     except Exception as e:
@@ -741,7 +1165,28 @@ def after_playing(error, guild_id):
             queue_cleanup_request(source.file_path)
     
     current_sources.pop(guild_id, None)
+
+    stopped_on_purpose = guild_id in _no_autoplay   # !stop / !kill / sleep timer: don't start anything new
+    _no_autoplay.discard(guild_id)
+    if getattr(source, "game", False):
+        return  # a guess-the-song clip ended: the game loop moves on by itself
     
+    # Programmatic stop from play_next_playlist_song (replacing the track): don't advance twice
+    if guild_id in suppress_after_playing:
+        suppress_after_playing.discard(guild_id)
+        return
+
+    # A streamed-playlist import is still fetching its first track: it starts playback itself
+    _q = playlist_queues.get(guild_id)
+    if _q and _q.get("starting"):
+        return
+
+    _sleep = _sleep_state.get(guild_id)
+    if _sleep and _sleep.get("mode") == "end" and not stopped_on_purpose:
+        playlist_force_after_stop.discard(guild_id)
+        asyncio.run_coroutine_threadsafe(_sleep_finish(guild_id, "end of song"), bot.loop)
+        return
+
     if guild_id in playlist_force_after_stop:
         playlist_force_after_stop.discard(guild_id)
         if PlaylistManager.get_playlist_status(guild_id)["status"] == "active":
@@ -769,8 +1214,37 @@ def after_playing(error, guild_id):
             play_next_playlist_song(guild_id), 
             bot.loop
         )
+    elif source is not None and not stopped_on_purpose and autoplay_enabled(guild_id):
+        # Nothing queued, no playlist: autoplay radio picks a similar song
+        asyncio.run_coroutine_threadsafe(autoplay_next(guild_id, source), bot.loop)
+    elif source is not None and not stopped_on_purpose:
+        session_clear(guild_id)   # it all played through: nothing left to resume
 
 async def play_next_playlist_song(guild_id):
+    """Advance the active playlist (duplicate concurrent advances are dropped)."""
+    if guild_id in _playlist_advancing:
+        # Don't run two advances at once, but don't lose the request either: a track may have
+        # been skipped/stopped while the previous advance was still finishing (double-skip).
+        _playlist_advance_pending.add(guild_id)
+        print(f"⏭️ Playlist advance already in progress for guild {guild_id} - queued behind it")
+        return
+    _playlist_advancing.add(guild_id)
+    try:
+        while True:
+            _playlist_advance_pending.discard(guild_id)
+            await _play_next_playlist_song_inner(guild_id)
+            if guild_id not in _playlist_advance_pending:
+                break
+            # A request arrived meanwhile: honour it only if the previous advance left nothing playing
+            guild = bot.get_guild(guild_id)
+            vc = guild.voice_client if guild else None
+            if not vc or vc.is_playing() or vc.is_paused() or guild_id not in playlist_queues:
+                break
+    finally:
+        _playlist_advancing.discard(guild_id)
+        _playlist_advance_pending.discard(guild_id)
+
+async def _play_next_playlist_song_inner(guild_id):
     """Play the next song in the active playlist"""
     try:
         print(f"🎵 Attempting to play next playlist song for guild {guild_id}")
@@ -780,6 +1254,7 @@ async def play_next_playlist_song(guild_id):
         print(f"🔍 Next song result: {result.get('status')}")
         
         if result["status"] == "finished":
+            session_clear(guild_id)
             # Playlist completed
             guild = bot.get_guild(guild_id)
             if guild and guild.voice_client:
@@ -790,7 +1265,12 @@ async def play_next_playlist_song(guild_id):
                         description=f"Finished playing playlist: **{result.get('playlist_name', 'Unknown')}**",
                         color=0x4caf50
                     )
-                    await channels[0].send(embed=embed)
+                    rain = await _scene_file(("rain", None), style_for(guild_id)) if BADGES_ENABLED else None
+                    if rain is not None:
+                        embed.set_image(url=f"attachment://{rain.filename}")
+                        await channels[0].send(embed=embed, file=rain)
+                    else:
+                        await channels[0].send(embed=embed)
             return
         
         if result["status"] != "success":
@@ -799,6 +1279,21 @@ async def play_next_playlist_song(guild_id):
         
         # Get song info
         song = result["song"]
+
+        # Streamed (YouTube-imported) entry: make sure its file is downloaded before playing it.
+        # Skipping past the prefetch buffer lands here too (it's fetched/promoted to the foreground lane).
+        if "status" in song and song.get("video_id"):
+            stream_queue = playlist_queues.get(guild_id)
+            ok = await _stream_wait_for_entry(guild_id, stream_queue, song)
+            if stream_queue is not None:
+                stream_queue["starting"] = False
+            if playlist_queues.get(guild_id) is not stream_queue or stream_queue is None:
+                return  # session was stopped/replaced while we were waiting
+            if not ok:
+                print(f"⏭️ Skipping unavailable track: {song.get('title')}")
+                await _play_next_playlist_song_inner(guild_id)
+                return
+
         audio_file = Path(song["audio_file"])
         
         print(f"🔍 Playing song: {song.get('title', 'Unknown')}")
@@ -809,7 +1304,7 @@ async def play_next_playlist_song(guild_id):
             print(f"⚠️ Playlist file missing: {audio_file}")
             print(f"❌ File not found, skipping to next song")
             # Try to continue with next song
-            await play_next_playlist_song(guild_id)
+            await _play_next_playlist_song_inner(guild_id)
             return
         
         # Get guild and voice client
@@ -822,6 +1317,7 @@ async def play_next_playlist_song(guild_id):
         
         # Stop current playback if any
         if voice_client.is_playing() or voice_client.is_paused():
+            suppress_after_playing.add(guild_id)
             voice_client.stop()
             await asyncio.sleep(0.5)
         
@@ -837,17 +1333,9 @@ async def play_next_playlist_song(guild_id):
             # Simple path normalization for FFmpeg
             
             # Use FFmpegPCMAudio - Discord.py handles Opus encoding internally
-            source = discord.FFmpegPCMAudio(audio_path, executable=get_ffmpeg_path(), **ffmpeg_options)
-            print(f"✅ Created FFmpegPCMAudio source for next song")
-            
-            print(f"✅ Next song FFmpeg source created successfully")
-            
-            audio_source = SimpleAudioSource(
-                source, 
-                title=song.get("title", "Unknown"),
-                duration=song.get("duration", 0),
-                file_path=str(audio_file)
-            )
+            audio_source = make_audio_source(guild_id, audio_file, title=song.get("title", "Unknown"),
+                                             duration=song.get("duration", 0), video_id=song.get("video_id"))
+            print(f"✅ Next song audio source created")
             
             current_sources[guild_id] = audio_source
             
@@ -867,8 +1355,7 @@ async def play_next_playlist_song(guild_id):
         notification_channel = get_notification_channel(guild_id)
         if notification_channel:
             embed = discord.Embed(
-                title="🎵 Now Playing from Playlist",
-                description=f"**{song.get('title', 'Unknown')}**",
+                title=vapor.title("now playing from playlist"),
                 color=0x9c27b0
             )
             embed.add_field(
@@ -886,8 +1373,10 @@ async def play_next_playlist_song(guild_id):
                 embed.add_field(name="Duration", value=f"⏱️ {duration_str}", inline=True)
             
             try:
-                await notification_channel.send(embed=embed)
-            except:
+                await send_now_playing(notification_channel, embed, audio_source, guild_id,
+                                       song.get('title', 'Unknown'), song.get('duration', 0),
+                                       cover_path=song.get('cover_path'))
+            except Exception:
                 print(f"⚠️ Could not send playlist notification to channel {notification_channel.name}")
         
     except Exception as e:
@@ -954,7 +1443,7 @@ class PlaylistManager:
         try:
             media_files = []
             
-            for webm_file in MEDIA_DIR.glob("*.webm"):
+            for webm_file in sorted(p for p in MEDIA_DIR.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTS):
                 try:
                     # Get metadata if available
                     json_file = webm_file.with_suffix('.json')
@@ -1007,7 +1496,7 @@ class PlaylistManager:
                 safe_title = "Unknown"
             
             # Create permanent filenames
-            audio_filename = f"{safe_title}_{timestamp}_{file_id}.webm"
+            audio_filename = f"{safe_title}_{timestamp}_{file_id}{current_path.suffix or '.webm'}"
             metadata_filename = f"{safe_title}_{timestamp}_{file_id}.json"
             
             permanent_audio_path = playlist_media_dir / audio_filename
@@ -1496,9 +1985,8 @@ async def on_command_error(ctx, error):
 @bot.event
 async def on_message(message):
     """Log all messages that start with command prefix for debugging"""
-    # Ignore messages from bots (including ourselves)
     if message.author.bot:
-        await bot.process_commands(message)  # Still process in case we want bot-to-bot commands
+        # Do not run commands on bot messages (avoids edge cases; duplicate instances are the real dual-reply cause).
         return
     
     # Log ALL messages for debugging (not just commands)
@@ -1530,38 +2018,1649 @@ async def on_message(message):
         except:
             pass
 
-def queue_audio_request(query):
-    """Queue request for background processing service"""
+# ============================================================================
+# ⚡ REQUEST PIPELINE — atomic queue files, heartbeat liveness (no fixed timeout),
+#    live progress → Discord
+# ============================================================================
+
+def _write_json_atomic(path, data):
+    """Write JSON via temp file + rename so the processor never reads a half-written file."""
+    path = Path(path)
+    tmp = path.with_name("." + path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    for attempt in range(8):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.02 * (attempt + 1))  # Windows: reader momentarily holds the target
+    os.replace(tmp, path)
+
+
+def queue_audio_request(query, lane="foreground"):
+    """Queue a download request. lane='background' is used for playlist batch prefetch."""
     request_id = str(uuid.uuid4())[:8]
     request_data = {
         'query': query,
         'request_id': request_id,
-        'timestamp': time.time()
+        'timestamp': time.time(),
+        'lane': lane,
     }
-    
-    request_file = QUEUE_DIR / f"request_{request_id}.json"
-    with open(request_file, 'w') as f:
-        json.dump(request_data, f, indent=2)
-    
+    _write_json_atomic(QUEUE_DIR / f"request_{request_id}.json", request_data)
     return request_id
+
+
+def queue_playlist_info_request(url, max_items=None):
+    """Ask the processor to flat-extract a YouTube playlist (ids/titles/durations only)."""
+    request_id = str(uuid.uuid4())[:8]
+    data = {
+        'type': 'playlist_info',
+        'url': url,
+        'request_id': request_id,
+        'timestamp': time.time(),
+        'lane': 'foreground',
+    }
+    if max_items:
+        data['max_items'] = int(max_items)
+    _write_json_atomic(QUEUE_DIR / f"request_{request_id}.json", data)
+    return request_id
+
+
+def cancel_queued_request(request_id):
+    """Cancel a request that the processor has NOT claimed yet. True if it was cancelled."""
+    try:
+        (QUEUE_DIR / f"request_{request_id}.json").unlink()
+        return True
+    except (FileNotFoundError, PermissionError):
+        return False
+
 
 def check_processing_result(request_id):
     """Check if background service has processed the request"""
     result_file = QUEUE_DIR / f"result_{request_id}.json"
-    
+
     if result_file.exists():
         try:
-            with open(result_file, 'r') as f:
+            with open(result_file, 'r', encoding='utf-8') as f:
                 result = json.load(f)
-            
-            # Clean up result file
+
+            # Clean up result + progress files
             result_file.unlink()
+            try:
+                (QUEUE_DIR / f"progress_{request_id}.json").unlink()
+            except OSError:
+                pass
             return result
         except Exception as e:
-            print(f"❌ Error reading result: {e}")
+            # Most likely caught mid-replace on Windows; the next poll will succeed
+            print(f"⚠️ Result not readable yet ({request_id}): {e}")
             return None
-    
+
     return None
+
+
+def read_progress(request_id):
+    """Latest progress beacon for a request (or None)."""
+    try:
+        with open(QUEUE_DIR / f"progress_{request_id}.json", 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _processor_heartbeat_age():
+    """Seconds since the audio processor last beat (inf if never / unreadable)."""
+    try:
+        t = float((QUEUE_DIR / ".processor_heartbeat").read_text().strip())
+        return max(0.0, time.time() - t)
+    except Exception:
+        return float('inf')
+
+
+def _queue_ahead(request_id):
+    """How many other foreground requests are waiting in the queue."""
+    n = 0
+    for rf in QUEUE_DIR.glob("request_*.json"):
+        if rf.name == f"request_{request_id}.json":
+            continue
+        try:
+            with open(rf, 'r', encoding='utf-8') as f:
+                if json.load(f).get('lane', 'foreground') != 'background':
+                    n += 1
+        except Exception:
+            continue
+    return n
+
+
+async def wait_for_request(request_id, on_progress=None, poll=0.25):
+    """
+    Wait for a processor result with NO fixed deadline.
+    Instead of timing out, we watch the processor's heartbeat: if it stops beating we
+    restart it once (queued request files survive) and only give up if it stays dead.
+    """
+    stale_since = None
+    restarted = False
+    while True:
+        result = check_processing_result(request_id)
+        if result is not None:
+            return result
+
+        if on_progress is not None:
+            try:
+                await on_progress(read_progress(request_id))
+            except Exception as e:
+                print(f"⚠️ progress callback error: {e}")
+
+        if _processor_heartbeat_age() < 20:
+            stale_since = None
+        else:
+            if stale_since is None:
+                stale_since = time.time()
+            if time.time() - stale_since > 5:
+                if not restarted:
+                    restarted = True
+                    print("⚠️ Audio processor heartbeat lost — restarting it")
+                    await asyncio.to_thread(_ensure_audio_processor_subprocess)
+                    stale_since = time.time() + 20  # grace while it boots
+                else:
+                    return {
+                        'status': 'error',
+                        'message': 'The audio processor is not responding. Try again in a moment.',
+                    }
+        await asyncio.sleep(poll)
+
+
+def _format_progress(prog):
+    """Progress beacon -> vaporwave status line (None if no beacon yet)."""
+    if not prog:
+        return None
+    stage = prog.get("stage")
+    if stage == "downloading":
+        return vapor.downloading(prog.get("percent"), prog.get("speed"), prog.get("eta"), prog.get("downloaded"))
+    if stage == "finishing":
+        return vapor.finishing()
+    return vapor.extracting()
+
+
+# ----------------------------------------------------------------------------
+# 🏷️ GIF BADGES — status headers ("NOW PLAYING", "DOWNLOADING", ...) are animated GIFs sent as their
+#    own message directly ABOVE the text message they label.
+#    vapor.* status builders return a StatusText: the body without a header plus `.badge` (the label).
+#    BadgeHeader.sync() keeps that header message in step and only re-uploads when the badge CHANGES,
+#    so progress edits stay text-only and cheap. If a GIF can't be built, the text header is used.
+#    Disable with GONDOR_GIFS=0.
+# ----------------------------------------------------------------------------
+
+BADGES_ENABLED = vapor.BADGES
+
+if BADGES_ENABLED:
+    threading.Thread(target=gif_art.prewarm, daemon=True, name="gif-prewarm").start()
+
+
+async def _scene_file(scene, style=None):
+    """discord.File for a terminal-scene GIF ('crash' with its error text, 'shutdown', 'rain'), or None."""
+    kind, text = scene
+    try:
+        data = await asyncio.to_thread(gif_art.terminal_bytes, kind, gif_art.resolve_style(style), text)
+        return discord.File(io.BytesIO(data), filename=f"{kind}.gif")
+    except Exception as e:
+        print(f"⚠️ terminal GIF unavailable ({kind}): {e}")
+        return None
+
+
+async def _badge_file(label, style=None, cover=None):
+    """discord.File for a badge GIF, or None if it can't be built."""
+    try:
+        data = await asyncio.to_thread(gif_art.header_bytes, label, style, cover)
+        return discord.File(io.BytesIO(data), filename=gif_art.slug(label) + ".gif")
+    except Exception as e:
+        print(f"⚠️ badge GIF unavailable ({label}): {e}")
+        return None
+
+
+class BadgeHeader:
+    """
+    The animated badge as its OWN message, sent directly above the text message it labels.
+    (Discord always draws attachments below a message's text, so a GIF can't sit above text inside
+    a single message; consecutive messages from the bot stack together instead.)
+    sync() keeps the header matching a status text and only re-uploads when the badge, the server's
+    style, or the cover art CHANGES.
+    """
+
+    def __init__(self, style=None):
+        self.msg = None
+        self.badge = None
+        self.style = style  # None -> follow the server's !style setting
+        self.cover = None   # gif_art.Cover (pixel-art thumbnail) shown on the left of the badge
+        self._key = None
+        self._dead = False  # the header message was deleted by someone: stop trying, use text headers
+
+    async def sync(self, dest, text):
+        """Make the header match `text`; returns the body for the message below it."""
+        badge = getattr(text, "badge", None) if BADGES_ENABLED else None
+        scene = getattr(text, "scene", None) if badge else None
+        if not badge:
+            await self.remove()  # plain text (or GIFs off): no header
+            return None if text is None else str(text)
+        fallback = getattr(text, "fallback", None) or str(text)  # same text WITH a text header
+        if self._dead:
+            return fallback
+        style = gif_art.effective_style(self.style or style_for(_dest_guild_id(dest)), self.cover)
+        key = (scene or badge, style, self.cover.key if self.cover is not None else None)
+        if key == self._key and self.msg is not None:
+            return str(text)
+        file = await (_scene_file(scene, style) if scene else _badge_file(badge, style, self.cover))
+        if file is None:
+            return fallback
+        try:
+            if self.msg is None:
+                self.msg = await dest.send(file=file)
+            else:
+                await self.msg.edit(attachments=[file])
+            self.badge, self._key = badge, key
+            return str(text)
+        except discord.NotFound:
+            self._dead = True
+            self.msg = self.badge = self._key = None
+        except discord.HTTPException as e:
+            print(f"⚠️ badge header failed: {e}")
+        return fallback
+
+    async def remove(self):
+        msg, self.msg, self.badge, self._key = self.msg, None, None, None
+        if msg is not None:
+            try:
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+
+
+async def send_status(dest, text):
+    """dest.send() for a status text: badge header first, then the text. Returns (message, header)."""
+    header = BadgeHeader()
+    body = await header.sync(dest, text)
+    msg = await dest.send(content=body)
+    return msg, header
+
+
+class StatusMessage:
+    """One Discord message edited in place (rate-limited); re-sends if it was deleted."""
+    MIN_INTERVAL = 1.0  # ~Discord's sustained edit limit (5 per 5s per channel); discord.py queues any excess
+
+    def __init__(self, ctx, initial_text):
+        self.ctx = ctx
+        self.initial = initial_text
+        self.msg = None
+        self._last_text = initial_text
+        self._last_edit = 0.0
+        self._dead = False
+        self._header = BadgeHeader()  # the GIF badge message above this one (shared with trackers)
+
+    async def start(self):
+        self.msg, self._header = await send_status(self.ctx, self.initial)
+        self._last_edit = time.time()
+
+    async def update(self, text):
+        """Cosmetic update: skipped if unchanged or too soon."""
+        if self._dead or self.msg is None or text == self._last_text:
+            return
+        now = time.time()
+        if now - self._last_edit < self.MIN_INTERVAL:
+            return
+        try:
+            body = await self._header.sync(self.ctx, text)
+            await self.msg.edit(content=body)
+            self._last_text = text
+            self._last_edit = now
+        except discord.NotFound:
+            self._dead = True
+        except discord.HTTPException:
+            pass
+
+    async def edit(self, content=None, embed=None):
+        """Final edit (always applied). If the message was deleted, send a fresh one."""
+        if not self._dead and self.msg is not None:
+            try:
+                body = await self._header.sync(self.ctx, content)
+                await self.msg.edit(content=body, embed=embed)
+                self._last_text = content
+                return
+            except discord.NotFound:
+                self._dead = True
+            except discord.HTTPException as e:
+                print(f"⚠️ status edit failed: {e}")
+        if content is not None or embed is not None:
+            await self._header.remove()
+            self._header = BadgeHeader()
+            body = await self._header.sync(self.ctx, content)
+            self.msg = await self.ctx.send(content=body, embed=embed)  # fresh message replaces the deleted one
+            self._dead = False
+
+    def progress_callback(self, request_id):
+        t0 = time.time()
+
+        async def cb(prog):
+            text = _format_progress(prog)
+            if text is None:
+                if time.time() - t0 < 1.0:
+                    return
+                text = vapor.queued(_queue_ahead(request_id))
+            await self.update(text)
+
+        return cb
+
+
+# ============================================================================
+# 📥 YOUTUBE PLAYLIST IMPORT — rolling batch prefetch
+#
+#   • Import = flat-extract the playlist, build an in-memory (and restart-safe) session
+#   • First track is fetched in the foreground lane so playback starts ASAP
+#   • A background poller keeps a window of downloaded tracks ahead of the playhead:
+#       when ready-ahead <= LOW_WATER and nothing is downloading -> request next BATCH
+#   • Default = delete after play (replay cache holds the last few);
+#     `keep` moves each finished track into playlists/<name>/ permanently
+# ============================================================================
+
+STREAM_BATCH_SIZE = max(1, int(os.environ.get("GONDOR_BATCH_SIZE", "5")))
+STREAM_LOW_WATER = max(0, int(os.environ.get("GONDOR_LOW_WATER", "2")))
+MAX_IMPORT_ITEMS = max(1, int(os.environ.get("GONDOR_MAX_PLAYLIST_ITEMS", "200")))
+
+stream_tasks = {}          # guild_id -> (asyncio.Task, queue)
+stream_status_msgs = {}    # guild_id -> StatusMessage
+_bg_tasks = set()          # keep strong refs to fire-and-forget tasks
+
+_PLAYLIST_URL_RE = re.compile(
+    r"(?:youtube\.com|music\.youtube\.com)/playlist\?(?:[^\s]*&)?list=", re.I
+)
+
+
+def _is_playlist_url(text):
+    """True for dedicated playlist pages (watch?v=..&list=.. still plays just that video)."""
+    return bool(_PLAYLIST_URL_RE.search(text or ""))
+
+
+def _spawn(coro):
+    task = asyncio.get_running_loop().create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
+def _make_stream_entry(e):
+    return {
+        "title": e["title"],
+        "video_id": e["id"],
+        "url": e["url"],
+        "duration": int(e.get("duration") or 0),
+        "status": "pending",      # pending | downloading | ready | failed
+        "audio_file": None,
+        "metadata_file": None,
+        "request_id": None,
+        "lane": None,
+        "attempts": 0,
+        "submitted_at": 0,
+        "added": time.time(),
+    }
+
+
+def _entry_file_ok(entry):
+    f = entry.get("audio_file")
+    return bool(f) and os.path.exists(f)
+
+
+def _stream_submit(entry, lane):
+    entry["request_id"] = queue_audio_request(entry["url"], lane=lane)
+    entry["lane"] = lane
+    entry["status"] = "downloading"
+    entry["attempts"] = entry.get("attempts", 0) + 1
+    entry["submitted_at"] = time.time()
+
+
+def _stream_promote(entry):
+    """We're waiting on this entry right now: if its background request is still unclaimed, re-queue as foreground."""
+    if entry.get("status") != "downloading" or entry.get("lane") != "background":
+        return
+    rid = entry.get("request_id")
+    if rid and cancel_queued_request(rid):
+        _stream_submit(entry, "foreground")
+
+
+def _stream_entry_failed(stream, entry, message):
+    print(f"⚠️ Stream entry failed ({entry.get('title')}): {message}")
+    entry["error"] = message
+    if entry.get("attempts", 0) < 2:
+        entry["status"] = "pending"      # one automatic retry
+    else:
+        entry["status"] = "failed"
+        stream["failed"] = stream.get("failed", 0) + 1
+
+
+def _stream_keep_entry(queue, entry):
+    """`keep` mode: move the finished file into playlists/<name>/ and record it in the permanent playlist."""
+    stream = queue["stream"]
+    name = stream["name"]
+    pdir = PLAYLIST_DIR / name
+    pdir.mkdir(exist_ok=True)
+
+    src = Path(entry["audio_file"])
+    safe_title = "".join(c for c in entry["title"] if c.isalnum() or c in (' ', '-', '_')).strip()[:30] or "Unknown"
+    stem = f"{safe_title}_{int(time.time())}_{str(uuid.uuid4())[:8]}"
+    dest = pdir / f"{stem}{src.suffix or '.webm'}"
+    meta_dest = pdir / f"{stem}.json"
+
+    shutil.move(str(src), str(dest))
+    side = src.with_suffix('.json')
+    if side.exists():
+        shutil.move(str(side), str(meta_dest))
+    else:
+        with open(meta_dest, 'w', encoding='utf-8') as f:
+            json.dump({"title": entry["title"], "duration": entry["duration"], "video_id": entry["video_id"]}, f, indent=2)
+
+    entry["audio_file"] = str(dest)
+    entry["metadata_file"] = str(meta_dest)
+
+    playlist_file = PLAYLIST_DIR / f"{name}.json"
+    if playlist_file.exists():
+        with open(playlist_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    else:
+        data = {"name": name, "created": time.time(), "files": [], "total_duration": 0}
+    data["files"].append({
+        "title": entry["title"],
+        "audio_file": str(dest),
+        "metadata_file": str(meta_dest),
+        "duration": entry["duration"],
+        "added": time.time(),
+        "video_id": entry["video_id"],
+    })
+    data["total_duration"] = sum(s.get("duration", 0) for s in data["files"])
+    with open(playlist_file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _stream_prefill_from_playlist(queue):
+    """`keep` mode: tracks already saved in the permanent playlist need no download."""
+    stream = queue["stream"]
+    playlist_file = PLAYLIST_DIR / f"{stream['name']}.json"
+    if not playlist_file.exists():
+        return
+    try:
+        with open(playlist_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return
+    known = {
+        s["video_id"]: s for s in data.get("files", [])
+        if s.get("video_id") and os.path.exists(s.get("audio_file", ""))
+    }
+    for e in queue["songs"]:
+        hit = known.get(e["video_id"])
+        if hit:
+            e["audio_file"] = hit["audio_file"]
+            e["metadata_file"] = hit.get("metadata_file")
+            e["status"] = "ready"
+            stream["fetched"] = stream.get("fetched", 0) + 1
+
+
+def _stream_harvest(queue):
+    """Collect finished downloads, retry failures, detect lost requests."""
+    stream = queue["stream"]
+    now = time.time()
+    for e in queue["songs"]:
+        st = e.get("status")
+        if st == "downloading":
+            rid = e.get("request_id")
+            res = check_processing_result(rid) if rid else None
+            if res is not None:
+                fp = res.get("file_path")
+                if res.get("status") == "success" and fp and os.path.exists(fp):
+                    e["audio_file"] = fp
+                    e["cover_path"] = res.get("cover_path")
+                    if res.get("duration"):
+                        e["duration"] = int(res["duration"])
+                    e["status"] = "ready"
+                    e["error"] = None
+                    stream["fetched"] = stream.get("fetched", 0) + 1
+                    if stream.get("keep"):
+                        try:
+                            _stream_keep_entry(queue, e)
+                        except Exception as err:
+                            print(f"⚠️ keep-move failed for {e.get('title')}: {err}")
+                else:
+                    _stream_entry_failed(stream, e, res.get("message", "download failed"))
+            else:
+                prog = read_progress(rid) if rid else None
+                ref = (prog or {}).get("updated") or e.get("submitted_at") or now
+                still_queued = bool(rid) and (QUEUE_DIR / f"request_{rid}.json").exists()
+                if not still_queued and now - ref > 120:
+                    _stream_entry_failed(stream, e, "download request was lost")
+        elif st == "ready" and not _entry_file_ok(e):
+            # File gone (replay cache evicted it / cleanup) — it will be re-fetched if needed again
+            e["status"] = "pending"
+            e["audio_file"] = None
+
+
+def _stream_upcoming(queue):
+    songs = queue["songs"]
+    idx = queue["current_index"]
+    ups = list(songs[idx:])
+    if queue.get("loop_mode") == "all":
+        ups += songs[:max(0, idx - 1)]
+    return ups
+
+
+def _stream_refill(queue):
+    """Watermark rule: when few ready tracks remain ahead and nothing is downloading, request the next batch."""
+    ups = _stream_upcoming(queue)
+    if not ups:
+        return
+    ready_ahead = sum(1 for e in ups if e["status"] == "ready" and _entry_file_ok(e))
+    inflight = sum(1 for e in ups if e["status"] == "downloading")
+    if inflight == 0 and ready_ahead <= STREAM_LOW_WATER:
+        batch = [e for e in ups if e["status"] == "pending"][:STREAM_BATCH_SIZE]
+        for e in batch:
+            _stream_submit(e, "background")
+        if batch:
+            print(f"📥 Requested next batch: {len(batch)} tracks (ready ahead was {ready_ahead})")
+
+
+def _stream_status_text(queue):
+    stream = queue["stream"]
+    total = queue["total_songs"]
+    fetched = stream.get("fetched", 0)
+    name = str(stream.get("display", queue["playlist_name"]))
+    skipped = stream.get("failed", 0)
+    note = stream.get("note")
+    active = next((e for e in queue["songs"] if e["status"] == "downloading"), None)
+    if active:
+        prog = read_progress(active["request_id"]) if active.get("request_id") else None
+        pct = prog.get("percent") if prog and prog.get("stage") == "downloading" else None
+        return vapor.import_status(name, fetched, total, pct, skipped=skipped, note=note)
+    return vapor.import_idle(name, fetched, total, skipped=skipped, note=note)
+
+
+async def _stream_update_status(queue, status_msg):
+    if status_msg is None:
+        return
+    await status_msg.update(_stream_status_text(queue))
+
+
+async def _kick_playlist(guild_id):
+    """Start the first track once any in-flight advance (e.g. an old session) has wound down."""
+    for _ in range(100):
+        if guild_id not in _playlist_advancing:
+            break
+        await asyncio.sleep(0.1)
+    await play_next_playlist_song(guild_id)
+
+
+def _stream_teardown(queue):
+    """Session over: cancel unclaimed requests, delete never-played downloads (unless `keep`)."""
+    stream = queue.get("stream") or {}
+    keep = stream.get("keep")
+    inflight = []
+    for e in queue["songs"]:
+        if e.get("status") == "downloading" and e.get("request_id"):
+            if not cancel_queued_request(e["request_id"]):
+                inflight.append(e["request_id"])  # already claimed; clean its file when it lands
+    if not keep:
+        for e in queue["songs"][queue.get("current_index", 0):]:
+            if e.get("status") == "ready" and _entry_file_ok(e) and not str(e["audio_file"]).startswith("playlists"):
+                queue_cleanup_request(e["audio_file"], keep_recent=False)
+    if inflight and not keep:
+        try:
+            _spawn(_stream_drain(inflight))
+        except RuntimeError:
+            pass
+
+
+async def _stream_drain(request_ids):
+    """Delete files from downloads that were already running when a session ended."""
+    deadline = time.time() + 120
+    pending = set(request_ids)
+    while pending and time.time() < deadline:
+        for rid in list(pending):
+            res = check_processing_result(rid)
+            if res is not None:
+                pending.discard(rid)
+                if res.get("status") == "success" and res.get("file_path"):
+                    queue_cleanup_request(res["file_path"], keep_recent=False)
+        await asyncio.sleep(1)
+
+
+async def _stream_poller(guild_id, queue, status_msg):
+    """Per-session background task: harvest results, refill batches, keep status fresh."""
+    last_proc_check = 0.0
+    no_vc_since = None
+    try:
+        while playlist_queues.get(guild_id) is queue:
+            _stream_harvest(queue)
+            _stream_refill(queue)
+            await _stream_update_status(queue, status_msg)
+
+            now = time.time()
+            if now - last_proc_check > 30:
+                last_proc_check = now
+                if _processor_heartbeat_age() > 30:
+                    print("⚠️ Stream poller: processor heartbeat lost — restarting it")
+                    await asyncio.to_thread(_ensure_audio_processor_subprocess)
+
+            # Bot was disconnected from voice and nobody is coming back: stop prefetching
+            guild = bot.get_guild(guild_id)
+            if not guild or not guild.voice_client:
+                no_vc_since = no_vc_since or now
+                if now - no_vc_since > 120:
+                    print("🛑 Stream poller: no voice connection for 2 min — ending playlist session")
+                    PlaylistManager.stop_playlist(guild_id)
+                    break
+            else:
+                no_vc_since = None
+
+            await asyncio.sleep(0.4)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"❌ Stream poller crashed: {e}")
+        traceback.print_exc()
+    finally:
+        _stream_teardown(queue)
+        cur = stream_tasks.get(guild_id)
+        if cur and cur[0] is asyncio.current_task():
+            stream_tasks.pop(guild_id, None)
+            stream_status_msgs.pop(guild_id, None)
+
+
+def _stream_ensure_poller(guild_id):
+    q = playlist_queues.get(guild_id)
+    if not q or not q.get("stream"):
+        return
+    cur = stream_tasks.get(guild_id)
+    if cur and not cur[0].done() and cur[1] is q:
+        return
+    task = asyncio.get_running_loop().create_task(
+        _stream_poller(guild_id, q, stream_status_msgs.get(guild_id))
+    )
+    stream_tasks[guild_id] = (task, q)
+
+
+async def _stream_wait_for_entry(guild_id, queue, entry):
+    """
+    Wait (async) until `entry` has a playable local file. Returns False if it can't be
+    fetched (caller skips it) or the session ended. Skipping past the buffer lands here:
+    a pending entry is requested in the foreground lane, a background one is promoted.
+    """
+    _stream_ensure_poller(guild_id)
+    t0 = time.time()
+    notice = None
+    notice_header = None
+    try:
+        while True:
+            if playlist_queues.get(guild_id) is not queue:
+                return False
+            st = entry.get("status")
+            if st == "ready" and _entry_file_ok(entry):
+                return True
+            if st == "failed":
+                return False
+            if st == "ready":
+                entry["status"] = st = "pending"
+                entry["audio_file"] = None
+            if st == "pending":
+                _stream_submit(entry, "foreground")
+            elif st == "downloading":
+                _stream_promote(entry)
+
+            if notice is None and time.time() - t0 > 1.5:
+                ch = get_notification_channel(guild_id)
+                if ch:
+                    try:
+                        notice, notice_header = await send_status(ch, vapor.buffering(entry.get("title", "?")))
+                    except Exception:
+                        notice = False
+                else:
+                    notice = False
+            await asyncio.sleep(0.25)
+    finally:
+        if notice:
+            try:
+                await notice.delete()
+            except Exception:
+                pass
+        if notice_header is not None:
+            await notice_header.remove()
+
+
+async def _begin_playlist_import(ctx, url, keep=False, shuffle=False, custom_name=None, preloaded_info=None):
+    """Shared by `!playlist import` and `!play <playlist url>`."""
+    guild_id = ctx.guild.id
+    set_notification_channel(guild_id, ctx.channel)
+
+    voice_client = ctx.guild.voice_client
+    if not voice_client or not _voice_session_usable(voice_client):
+        await ctx.send("❌ I'm not connected to a voice channel! Use `!summon` first.")
+        return
+    if not url.lower().startswith(("http://", "https://")):
+        await ctx.send("❌ Usage: `!playlist import <youtube playlist url> [keep] [shuffle] [name]`")
+        return
+
+    status = StatusMessage(ctx, vapor.reading_playlist())
+    await status.start()
+
+    if preloaded_info is not None:
+        info = preloaded_info      # e.g. !likes play: the entries are already known
+    else:
+        request_id = queue_playlist_info_request(url, MAX_IMPORT_ITEMS)
+        info = await wait_for_request(request_id, on_progress=status.progress_callback(request_id))
+    if info.get("status") != "success":
+        await status.edit(content=vapor.error_label(info.get("message", "Unknown error")))
+        return
+
+    entries = [_make_stream_entry(e) for e in info["entries"]]
+    yt_title = info.get("title") or "YouTube Playlist"
+    safe_name = "".join(c for c in (custom_name or yt_title) if c.isalnum() or c in (' ', '-', '_')).strip()[:60]
+    if keep and not safe_name:
+        safe_name = f"import_{int(time.time())}"
+
+    queue = {
+        "playlist_name": safe_name or yt_title,
+        "songs": list(entries),
+        "original_songs": list(entries),   # same dict objects -> status updates are shared
+        "current_index": 0,
+        "total_songs": len(entries),
+        "shuffle": False,
+        "loop_mode": "off",
+        "starting": True,                  # after_playing must not advance until entry 0 is playing
+        "stream": {
+            "keep": bool(keep),
+            "name": safe_name,
+            "display": yt_title,
+            "source_url": url,
+            "fetched": 0,
+            "failed": 0,
+        },
+    }
+    if shuffle:
+        random.shuffle(queue["songs"])     # decide the order up front so batches follow it
+        queue["shuffle"] = True
+    if keep:
+        _stream_prefill_from_playlist(queue)
+
+    # Replacing an old session: its poller notices and tears itself down
+    playlist_queues[guild_id] = queue
+    stream_status_msgs[guild_id] = status
+
+    # First track: foreground lane (playback starts ASAP). The poller then batches the rest.
+    first = next((e for e in queue["songs"] if e["status"] == "pending"), None)
+    if first is not None and queue["songs"][0] is first:
+        _stream_submit(first, "foreground")
+    _stream_ensure_poller(guild_id)
+    _spawn(_kick_playlist(guild_id))
+
+    mode = "keep" if keep else "delete after play"
+    extra = f" ～ first {len(entries)} of {info['total']}" if info.get("truncated") else ""
+    queue["stream"]["note"] = f"{mode}{extra}"
+    await status.edit(content=_stream_status_text(queue))
+    try:
+        card = vapor.playlist_card(yt_title, len(entries), sum(int(e.get("duration") or 0) for e in entries),
+                                   shuffled=bool(shuffle), keep=bool(keep))
+        await reply_note(ctx, card, lifetime=max(NOTE_SECONDS * 2, 0) if NOTE_SECONDS else 0)
+    except Exception as e:
+        print(f"⚠️ playlist card failed: {e}")
+
+
+def _restore_stream_session(guild_id):
+    """After a restart: re-link shared entry dicts, reset interrupted downloads, resume prefetching."""
+    q = playlist_queues.get(guild_id)
+    if not q or not q.get("stream"):
+        return
+    by_id = {e["video_id"]: e for e in q["songs"]}
+    q["original_songs"] = [by_id.get(e["video_id"], e) for e in q.get("original_songs", [])]
+    for e in q["songs"]:
+        if e.get("status") == "downloading":
+            e["status"] = "pending"
+            e["request_id"] = None
+    q["starting"] = False
+    _stream_ensure_poller(guild_id)
+
+
+# ============================================================================
+# 🍩 SUMMON ANIMATION — spinning ASCII donut (donut.c) while Gondor connects to voice
+#    One message, edited every ~0.3s (Discord throttles to ~1/s after a short burst; frames are
+#    picked by elapsed time so the spin speed stays constant even when throttled). Frames are
+#    pre-rendered once in a background thread. Disable with GONDOR_DONUT=0.
+# ============================================================================
+
+DONUT_ENABLED = os.environ.get("GONDOR_DONUT", "1").strip().lower() not in ("0", "false", "no", "off")
+DONUT_MIN_SECONDS = float(os.environ.get("GONDOR_DONUT_SECONDS", "4"))  # play at least this long
+DONUT_FRAME_INTERVAL = float(os.environ.get("GONDOR_DONUT_INTERVAL", "0.3"))  # seconds per frame (Discord allows ~5 edits/5s, so ~1/s sustained)
+
+if DONUT_ENABLED:
+    threading.Thread(target=donut.get_frames, daemon=True, name="donut-prewarm").start()
+
+
+def _donut_message(frame_text, caption):
+    return "```\n" + caption + "\n" + frame_text + "\n```"
+
+
+class DonutAnimation:
+    """Edits one message with successive donut frames until stop() is called."""
+
+    def __init__(self, message, frames, caption, min_seconds=DONUT_MIN_SECONDS):
+        self.message = message
+        self.frames = frames
+        self.caption = caption
+        self.min_seconds = min_seconds
+        self._t0 = time.time()
+        self._stop_event = asyncio.Event()
+        self._task = None
+        self._stopped = False
+        self._dead = False  # message was deleted
+
+    def start(self):
+        self._task = asyncio.get_running_loop().create_task(self._run())
+
+    async def _run(self):
+        last = 0  # frame 0 is already on screen
+        while not self._stop_event.is_set():
+            # Wait until the next absolute tick (not a fixed sleep), so edit latency doesn't stretch the interval.
+            elapsed = time.time() - self._t0
+            wait = (int(elapsed / DONUT_FRAME_INTERVAL) + 1) * DONUT_FRAME_INTERVAL - elapsed
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=max(wait, 0.01))
+                return  # stop requested
+            except asyncio.TimeoutError:
+                pass
+            # Pick the frame from elapsed time, not from an edit counter: if Discord's rate limit
+            # delays an edit, we skip ahead instead of slowing the spin down.
+            idx = int((time.time() - self._t0) / DONUT_FRAME_INTERVAL) % len(self.frames)
+            if idx == last:
+                continue
+            last = idx
+            try:
+                await self.message.edit(content=_donut_message(self.frames[idx], self.caption))
+            except discord.NotFound:
+                self._dead = True
+                return
+            except discord.HTTPException:
+                pass  # rate-limited / transient: just skip this frame
+
+    async def stop(self, final_content=None, respect_min=True):
+        """Finish the animation and replace the message with final_content. Safe to call twice."""
+        if self._stopped:
+            return
+        self._stopped = True
+        if respect_min:
+            remaining = self.min_seconds - (time.time() - self._t0)
+            if remaining > 0:
+                await asyncio.sleep(remaining)  # let the donut keep spinning a little
+        self._stop_event.set()
+        if self._task is not None:
+            try:
+                await self._task  # lets an in-flight edit finish, so it can't land after our final edit
+            except Exception:
+                pass
+        if final_content is not None and not self._dead:
+            try:
+                await self.message.edit(content=final_content)
+            except discord.HTTPException as e:
+                print(f"⚠️ summon final edit failed: {e}")
+
+
+class GifSummon:
+    """
+    The summon animation as an animated GIF attachment: Discord plays it by itself (smooth, no edit
+    rate limit), so all we do is remove it again when the connection attempt is over.
+    Same interface as DonutAnimation (stop()).
+    """
+
+    def __init__(self, message, min_seconds=DONUT_MIN_SECONDS):
+        self.message = message
+        self.min_seconds = min_seconds
+        self._t0 = time.time()
+        self._stopped = False
+
+    async def stop(self, final_content=None, respect_min=True):
+        if self._stopped:
+            return
+        self._stopped = True
+        if respect_min:
+            remaining = self.min_seconds - (time.time() - self._t0)
+            if remaining > 0:
+                await asyncio.sleep(remaining)  # let the donut spin for a moment
+        if final_content is not None:
+            try:
+                await self.message.edit(content=final_content, attachments=[])  # drop the GIF
+            except discord.HTTPException as e:
+                print(f"⚠️ summon final edit failed: {e}")
+
+
+async def _start_summon_animation(ctx, channel_name):
+    """Send the spinning donut (GIF, or text frames as a fallback). Returns (message, animation or None)."""
+    if not DONUT_ENABLED:
+        return await ctx.send(f"🎵 Connecting to **{channel_name}**..."), None
+    if BADGES_ENABLED:
+        try:
+            data = await asyncio.to_thread(gif_art.donut_bytes, gif_art.resolve_style(style_for(_dest_guild_id(ctx))))
+            msg = await ctx.send(file=discord.File(io.BytesIO(data), filename="summoning.gif"))
+            return msg, GifSummon(msg)
+        except Exception as e:
+            print(f"⚠️ donut GIF unavailable, using text donut: {e}")
+    frames = await asyncio.to_thread(donut.get_frames)
+    # Caption must stay within the donut's width, or Discord wraps the code block and scrambles it.
+    caption = "~ summoning gondor ~".center(donut.WIDTH).rstrip()
+    msg = await ctx.send(_donut_message(frames[0], caption))
+    anim = DonutAnimation(msg, frames, caption)
+    anim.start()
+    return msg, anim
+
+
+async def _finish_summon(msg, anim, content):
+    if anim is not None:
+        await anim.stop(content)
+    else:
+        await msg.edit(content=content)
+
+
+# ============================================================================
+# ⚙️ SETTINGS, SHORT NOTES, PLAYBACK CONTROLS
+#    gondor_settings.json keeps per-server `!style` and volume. Notes are short replies with an animated
+#    badge that delete themselves after GONDOR_NOTE_SECONDS (0 = keep). The control helpers are shared by
+#    the chat commands and the now-playing buttons so both behave identically.
+# ============================================================================
+
+SETTINGS_FILE = Path(__file__).resolve().parent / "gondor_settings.json"
+NOTE_SECONDS = max(0.0, float(os.environ.get("GONDOR_NOTE_SECONDS", "12")))
+PRESENCE_ENABLED = _env_flag("GONDOR_PRESENCE")
+NP_COUNTDOWN = _env_flag("GONDOR_NP_COUNTDOWN")
+NP_BUTTONS_ENABLED = _env_flag("GONDOR_NP_BUTTONS")
+DEFAULT_VOLUME = 0.8
+SEEK_STEP = 10  # seconds for !forward / !rewind and the skip buttons
+SCRUB_STEPS = 20  # jump points offered in the scrub dropdown (every 100/SCRUB_STEPS % of the track)
+
+_settings = {}
+
+
+def _load_settings():
+    global _settings
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _settings = data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        _settings = {}
+    except Exception as e:
+        print(f"⚠️ Could not read {SETTINGS_FILE.name}: {e}")
+        _settings = {}
+
+
+_load_settings()
+
+
+def guild_setting(guild_id, key, default=None):
+    return (_settings.get(str(guild_id)) or {}).get(key, default)
+
+
+def set_guild_setting(guild_id, key, value):
+    _settings.setdefault(str(guild_id), {})[key] = value
+    try:
+        _write_json_atomic(SETTINGS_FILE, _settings)
+    except Exception as e:
+        print(f"⚠️ Could not save {SETTINGS_FILE.name}: {e}")
+
+
+def _dest_guild_id(dest):
+    guild = getattr(dest, "guild", None) or getattr(getattr(dest, "channel", None), "guild", None)
+    return getattr(guild, "id", None)
+
+
+def style_for(guild_id):
+    if not guild_id:
+        return gif_art.DEFAULT_STYLE
+    pref = guild_setting(guild_id, "style")
+    return "auto" if pref == "auto" else gif_art.resolve_style(pref)   # "auto": colours follow the cover art
+
+
+def load_cover(path):
+    """Pixel-art cover from a processor-made cover_*.rgb file, or None."""
+    if not path:
+        return None
+    try:
+        data = Path(path).read_bytes()
+        if len(data) != gif_art.COVER_W * gif_art.COVER_H * 3:
+            return None
+        return gif_art.cover_from_rgb(data, gif_art.COVER_W, gif_art.COVER_H, Path(path).stem)
+    except Exception:
+        return None
+
+
+def get_volume(guild_id):
+    src = current_sources.get(guild_id)
+    if src is not None and hasattr(src, "volume"):
+        return src.volume
+    return guild_setting(guild_id, "volume", DEFAULT_VOLUME)
+
+
+def set_volume(guild_id, percent):
+    pct = max(0, min(200, int(round(percent))))
+    set_guild_setting(guild_id, "volume", pct / 100)
+    src = current_sources.get(guild_id)
+    if src is not None and hasattr(src, "volume"):
+        src.volume = pct / 100
+    return pct
+
+
+def toggle_mute(guild_id):
+    """Mute (remembering the level) or restore the level from before the mute. Returns (muted, percent)."""
+    current = get_volume(guild_id)
+    if current > 0:
+        set_guild_setting(guild_id, "premute", current)
+        set_volume(guild_id, 0)
+        return True, 0
+    previous = guild_setting(guild_id, "premute") or DEFAULT_VOLUME
+    return False, set_volume(guild_id, previous * 100)
+
+
+def apply_saved_volume(guild_id, source):
+    saved = guild_setting(guild_id, "volume")
+    if saved is not None and hasattr(source, "volume"):
+        source.volume = float(saved)
+
+
+async def _delete_later(messages, delay):
+    await asyncio.sleep(delay)
+    for m in messages:
+        if m is not None:
+            try:
+                await m.delete()
+            except discord.HTTPException:
+                pass
+
+
+async def reply_note(dest, text, lifetime=None):
+    """Send a short reply (badge GIF above, framed text below) that removes itself after `lifetime` seconds."""
+    header = BadgeHeader()
+    body = await header.sync(dest, text)
+    msg = await dest.send(content=body)
+    life = NOTE_SECONDS if lifetime is None else lifetime
+    if life > 0:
+        _spawn(_delete_later([header.msg, msg], life))
+    return msg
+
+
+_presence_name = object()
+
+
+async def update_presence():
+    """'Listening to <song>' on the bot's profile while something plays; cleared when nothing does."""
+    global _presence_name
+    if not PRESENCE_ENABLED:
+        return
+    title = None
+    for src in list(current_sources.values()):
+        t = getattr(src, "title", None)
+        if t and not getattr(src, "game", False):   # a guessing-game clip must not give the answer away
+            title = str(t)
+    name = title[:120] if title else None
+    if name == _presence_name:
+        return
+    _presence_name = name
+    try:
+        activity = discord.Activity(type=discord.ActivityType.listening, name=name) if name else None
+        await bot.change_presence(activity=activity)
+    except Exception as e:
+        print(f"⚠️ presence update failed: {e}")
+
+
+def _voice_client_for(guild_id):
+    guild = bot.get_guild(guild_id)
+    return guild.voice_client if guild else None
+
+
+def pause_current(guild_id):
+    vc = _voice_client_for(guild_id)
+    if vc and vc.is_playing():
+        vc.pause()
+        return True, "Paused"
+    return False, "Nothing playing"
+
+
+def resume_current(guild_id):
+    vc = _voice_client_for(guild_id)
+    if vc and vc.is_paused():
+        vc.resume()
+        return True, "Resumed"
+    return False, "Nothing paused"
+
+
+def skip_current(guild_id):
+    """Skip the current track (playlist-aware). Returns (ok, message)."""
+    vc = _voice_client_for(guild_id)
+    if not vc or not vc.is_connected():
+        return False, "I'm not connected to a voice channel."
+    if not (vc.is_playing() or vc.is_paused()):
+        return False, "Nothing playing"
+    if PlaylistManager.get_playlist_status(guild_id)["status"] == "active":
+        result = PlaylistManager.skip_song(guild_id, "next")
+        if result["status"] != "success":
+            return False, result["message"]
+        playlist_force_after_stop.add(guild_id)
+        vc.stop()
+        return True, result["message"]
+    if song_queues.get(guild_id):
+        vc.stop()
+        return True, "Skipped — playing next in queue"
+    vc.stop()
+    return True, "Stopped"
+
+
+def stop_current(guild_id):
+    """Stop playback and end any active playlist. Returns (ok, message)."""
+    # End the playlist session FIRST: stopping the voice client fires after_playing, which would
+    # otherwise advance to the next playlist track. (For YouTube imports this also cancels the
+    # prefetch and deletes downloaded-but-unplayed files.)
+    try:
+        snapshot_session(guild_id)   # remember what was playing so the dashboard can resume it later
+    except Exception as e:
+        print(f"⚠️ session snapshot failed: {e}")
+    stopped_playlist = None
+    playlist_note = ""
+    pl_status = PlaylistManager.get_playlist_status(guild_id)
+    if pl_status["status"] == "active":
+        stopped_playlist = PlaylistManager.stop_playlist(guild_id)
+        playlist_note = f" (ended playlist **{pl_status['playlist_name']}**)"
+
+    vc = _voice_client_for(guild_id)
+    if not vc:
+        return False, "Not connected"
+    if vc.is_playing() or vc.is_paused():
+        # Queue cleanup of any active files before stopping (never playlist files)
+        source = current_sources.get(guild_id)
+        if source and hasattr(source, 'file_path') and source.file_path:
+            if not str(source.file_path).startswith('playlists'):
+                queue_cleanup_request(source.file_path)
+
+        _no_autoplay.add(guild_id)
+        vc.stop()
+        current_sources.pop(guild_id, None)
+
+        # Also clear the song queue when stopping
+        queue_count = clear_song_queue(guild_id)
+        if queue_count > 0:
+            return True, f"⏹️ **Stopped** (cleared {queue_count} queued songs){playlist_note}"
+        return True, f"⏹️ **Stopped**{playlist_note}"
+    if stopped_playlist:
+        # Nothing audible (e.g. still buffering the next track) but a playlist was active
+        clear_song_queue(guild_id)
+        return True, f"⏹️ **Stopped**{playlist_note}"
+    return False, "Nothing playing"
+
+
+def _parse_clock(text):
+    """'90', '1:30', '1:02:03', '90s', '1m30s', '1h2m3s' -> seconds."""
+    text = text.strip().lower().replace(" ", "")
+    if re.fullmatch(r"\d+(?::\d{1,2}){0,2}", text):
+        total = 0
+        for part in text.split(":"):
+            total = total * 60 + int(part)
+        return total
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?", text)
+    if m and any(m.groups()):
+        h, mi, sec = (int(g or 0) for g in m.groups())
+        return h * 3600 + mi * 60 + sec
+    raise ValueError(f"can't read '{text}' as a time")
+
+
+def parse_seek(spec):
+    """'1:30' -> ('to', 90); '+30' / '-15' -> ('by', +30 / -15)."""
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("give a time like `1:30`, `+30` or `-15`")
+    if spec[0] in "+-":
+        secs = _parse_clock(spec[1:])
+        return "by", secs if spec[0] == "+" else -secs
+    return "to", _parse_clock(spec)
+
+
+def seek_current(guild_id, *, to=None, by=None):
+    """
+    Jump within the playing track by restarting ffmpeg at the new position and swapping it into the
+    running voice player (so playback never stops and nothing gets cleaned up).
+    Returns (True, (from_s, to_s, duration)) or (False, error text).
+    """
+    vc = _voice_client_for(guild_id)
+    old = current_sources.get(guild_id)
+    if not vc or not vc.is_connected() or old is None or not (vc.is_playing() or vc.is_paused()):
+        return False, "Nothing playing"
+    path = getattr(old, "file_path", None)
+    if not path or not os.path.exists(path) or not hasattr(old, "start_offset"):
+        return False, "Can't seek this track"
+    if getattr(old, "game", False):
+        return False, "No seeking during the guessing game"
+    frm = old.elapsed
+    duration = old.duration or 0
+    target = float(to) if to is not None else frm + float(by or 0)
+    target = max(0.0, target)
+    if duration:
+        target = min(target, max(0.0, duration - 2))
+    was_paused = vc.is_paused()
+    new = make_audio_source(guild_id, path, title=old.title, duration=old.duration,
+                            requester=getattr(old, "requester", None), video_id=getattr(old, "video_id", None),
+                            start_offset=target, volume=old.volume)
+    new.master = getattr(old, "master", 1.0)
+    current_sources[guild_id] = new
+    tracker = _np_trackers.get(guild_id)
+    if tracker is not None:
+        tracker.source = new
+        tracker.force = True
+    vc.source = new  # swap into the running player (this briefly un-pauses it)
+    if was_paused:
+        vc.pause()
+    # Retire the old ffmpeg a moment later: the player thread may be mid-read on it right now.
+    asyncio.get_running_loop().call_later(1.0, old.cleanup)
+    return True, (frm, target, duration)
+
+
+# ============================================================================
+# 🎚️ LIVE NOW-PLAYING — the equalizer bar in the "now playing" message tracks the song's real position
+#    One tracker per guild. Position comes from SimpleAudioSource.elapsed (audio frames actually
+#    played, so pauses are handled). The message is edited every NP_INTERVAL seconds; Discord allows
+#    ~5 edits / 5s per channel, so 3s leaves plenty of room for the bot's other messages.
+#    Disable with GONDOR_NP_LIVE=0 (messages then stay static, as before).
+# ============================================================================
+
+NP_LIVE_ENABLED = os.environ.get("GONDOR_NP_LIVE", "1").strip().lower() not in ("0", "false", "no", "off")
+NP_INTERVAL = max(1.0, float(os.environ.get("GONDOR_NP_INTERVAL", "3")))
+NP_TICK = 0.5  # how often we check whether the track ended (so the final edit is prompt)
+
+_np_trackers = {}  # guild_id -> NowPlayingTracker
+
+
+class JumpModal(discord.ui.Modal, title="Jump to a time"):
+    """Pop-up asking for an exact position ('1:30', '90', '+30', '-15')."""
+
+    def __init__(self, guild_id):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.time_input = discord.ui.TextInput(label="Time  (1:30 · 90 · +30 · -15)", placeholder="1:30",
+                                               max_length=12, required=True)
+        self.add_item(self.time_input)
+
+    async def on_submit(self, interaction):
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("❌ **Access denied.** This needs authorization.",
+                                                    ephemeral=True, delete_after=6)
+            return
+        try:
+            mode, secs = parse_seek(self.time_input.value)
+        except ValueError as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True, delete_after=8)
+            return
+        ok, info = seek_current(self.guild_id, **{mode: secs})
+        if ok:
+            await interaction.response.defer()
+        else:
+            await interaction.response.send_message(f"❌ {info}", ephemeral=True, delete_after=6)
+
+
+def scrub_points(duration, steps=None):
+    """Evenly spaced (seconds, percent) jump targets across a track: 0%, 5%, 10% ... 95%."""
+    steps = steps or SCRUB_STEPS
+    pts, seen = [], set()
+    for k in range(steps):
+        secs = int(duration * k / steps)
+        if secs not in seen:
+            seen.add(secs)
+            pts.append((secs, int(round(100 * k / steps))))
+    return pts
+
+
+class NowPlayingView(discord.ui.View):
+    """
+    Controls under the now-playing message:
+      row 1: rewind 10s · pause/resume · skip · forward 10s
+      row 2: stop · mute (shows the state) · "jump to exact time" pop-up
+      row 3: volume dropdown (0-200%); its label shows the current volume
+      row 4: scrub dropdown with numbered jump points; its label shows the live position
+    At most 4 buttons per row, because narrow windows / phones wrap a 5th one onto its own line.
+    """
+
+    def __init__(self, guild_id, duration=0):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.duration = duration or 0
+        sec, pri, dan = discord.ButtonStyle.secondary, discord.ButtonStyle.primary, discord.ButtonStyle.danger
+
+        def add(emoji, callback, style=sec, row=0, label=None):
+            b = discord.ui.Button(emoji=emoji, label=label, style=style, row=row)
+            b.callback = callback
+            self.add_item(b)
+            return b
+
+        add("⏪", self._rewind)  # emoji-only buttons, max 4 per row
+        self.pause_btn = add("⏸️", self._pause, pri)
+        add("⏭️", self._skip)
+        add("⏩", self._forward)
+        add("⏹️", self._stop, dan, row=1)
+        self.mute_btn = add("🔊", self._mute, row=1)
+        add("🎯", self._jump, row=1)
+        add("🗳️", self._vote, row=1)
+        vol_options = [
+            discord.SelectOption(
+                label="0%  ·  mute" if pct == 0 else f"{pct}%" + ("  ·  boost" if pct > 100 else ""),
+                value=str(pct),
+                description="▮" * (min(pct, 100) // 10) + "▯" * (10 - min(pct, 100) // 10))
+            for pct in range(0, 201, 10)
+        ]
+        self.volume_sel = discord.ui.Select(placeholder="🔊 Volume 80%", options=vol_options, row=2)
+        self.volume_sel.callback = self._volume_pick
+        self.add_item(self.volume_sel)
+        self.scrub = None
+        if self.duration > 0:
+            options = [
+                discord.SelectOption(
+                    label=f"{vapor._fmt_clock(secs)}  ·  {pct}%", value=str(secs),
+                    description="▰" * (pct // 10) + "▱" * (10 - pct // 10))
+                for secs, pct in scrub_points(self.duration)
+            ]
+            self.scrub = discord.ui.Select(placeholder=f"⏱ 0:00 / {vapor._fmt_clock(self.duration)} — scrub to…",
+                                           options=options, row=3)
+            self.scrub.callback = self._scrub
+            self.add_item(self.scrub)
+
+    def sync(self, paused, elapsed=None, volume=None):
+        self.pause_btn.emoji = "▶️" if paused else "⏸️"
+        if volume is not None:
+            pct = int(round(volume * 100))
+            self.volume_sel.placeholder = "🔇 Muted" if pct == 0 else f"🔊 Volume {pct}%"
+            self.mute_btn.emoji = "🔇" if pct == 0 else "🔊"
+            self.mute_btn.style = discord.ButtonStyle.danger if pct == 0 else discord.ButtonStyle.secondary
+        if self.scrub is not None and elapsed is not None:
+            now = vapor._fmt_clock(min(elapsed, self.duration))
+            self.scrub.placeholder = f"⏱ {now} / {vapor._fmt_clock(self.duration)} — scrub to…"
+
+    async def _scrub(self, interaction):
+        if not await self._guard(interaction):
+            return
+        ok, info = seek_current(self.guild_id, to=float(self.scrub.values[0]))
+        await self._done(interaction, ok, info)
+
+    async def _jump(self, interaction):
+        if not await self._guard(interaction):
+            return
+        await interaction.response.send_modal(JumpModal(self.guild_id))
+
+    async def _guard(self, interaction, need_auth=True):
+        if interaction.guild_id != self.guild_id:
+            await interaction.response.send_message("❌ These buttons belong to another server.", ephemeral=True)
+            return False
+        if need_auth and not is_authorized(interaction.user.id):
+            print(f"🚫 Unauthorized button press: {interaction.user} ({interaction.user.id})")
+            await interaction.response.send_message("❌ **Access denied.** This needs authorization.",
+                                                    ephemeral=True, delete_after=6)
+            return False
+        return True
+
+    async def _done(self, interaction, ok, text):
+        if ok:
+            await interaction.response.defer()  # the tracker refreshes the message itself
+        else:
+            await interaction.response.send_message(f"❌ {text}", ephemeral=True, delete_after=6)
+
+    async def _pause(self, interaction):
+        if not await self._guard(interaction, need_auth=False):
+            return
+        vc = _voice_client_for(self.guild_id)
+        ok, text = resume_current(self.guild_id) if (vc and vc.is_paused()) else pause_current(self.guild_id)
+        await self._done(interaction, ok, text)
+
+    async def _skip(self, interaction):
+        if not await self._guard(interaction):
+            return
+        set_notification_channel(self.guild_id, interaction.channel)
+        ok, text = skip_current(self.guild_id)
+        await self._done(interaction, ok, text)
+
+    async def _stop(self, interaction):
+        if not await self._guard(interaction):
+            return
+        ok, text = stop_current(self.guild_id)
+        await self._done(interaction, ok, text)
+
+    async def _seek_by(self, interaction, delta):
+        if not await self._guard(interaction):
+            return
+        ok, info = seek_current(self.guild_id, by=delta)
+        await self._done(interaction, ok, info)
+
+    async def _rewind(self, interaction):
+        await self._seek_by(interaction, -SEEK_STEP)
+
+    async def _forward(self, interaction):
+        await self._seek_by(interaction, SEEK_STEP)
+
+    def _refresh_now(self):
+        tracker = _np_trackers.get(self.guild_id)
+        if tracker is not None:
+            tracker.force = True  # redraw the label right away
+
+    async def _volume_pick(self, interaction):
+        if not await self._guard(interaction):
+            return
+        set_volume(self.guild_id, float(self.volume_sel.values[0]))
+        self._refresh_now()
+        await interaction.response.defer()
+
+    async def _vote(self, interaction):
+        if not await self._guard(interaction, need_auth=False):
+            return
+        ok, text, passed = cast_vote(self.guild_id, interaction.user)
+        if not ok:
+            await interaction.response.send_message(f"❌ {text}", ephemeral=True, delete_after=6)
+            return
+        await interaction.response.defer()
+        set_notification_channel(self.guild_id, interaction.channel)
+        await reply_note(interaction.channel, vapor.note("skipped" if passed else "voted",
+                                                         _safe_name(interaction.user.display_name), text))
+
+    async def _mute(self, interaction):
+        if not await self._guard(interaction):
+            return
+        toggle_mute(self.guild_id)
+        self._refresh_now()
+        await interaction.response.defer()
+
+
+class NowPlayingTracker:
+    """Keeps one message's progress bar in step with one audio source until that source stops."""
+
+    def __init__(self, guild_id, source, message, embed, header, title, duration, cached=False):
+        self.guild_id = guild_id
+        self.source = source
+        self.message = message  # a real discord.Message (never a StatusMessage: that would re-send if deleted)
+        self.embed = embed      # set when the frame lives in this embed's description
+        self.header = header    # BadgeHeader: the GIF badge message sitting above `message`
+        self.title = title
+        self.duration = duration or 0
+        self.cached = cached
+        self.view = NowPlayingView(guild_id, duration) if NP_BUTTONS_ENABLED else None
+        self.force = False      # set to make the next tick edit immediately (e.g. after a seek)
+        self._stop_event = asyncio.Event()
+        self._task = None
+        self._dead = False
+        self.lyrics = None        # None: not looked up yet · False: none found · else [(seconds, text)]
+        self._lyric_task = None
+        self._start_pos = getattr(source, "start_offset", 0.0)
+
+    def _ensure_lyrics(self):
+        if self.lyrics is not None or self._lyric_task is not None:
+            return
+        self._lyric_task = _spawn(self._load_lyrics())
+
+    async def _load_lyrics(self):
+        entry = await fetch_lyrics(self.title, self.duration)
+        self.lyrics = entry["lines"] if (entry and entry.get("lines")) else False
+        self.force = True
+
+    def _lyric_row(self):
+        """None when live lyrics are off, otherwise the current line ('' = a gap in the song)."""
+        if not lyrics_enabled(self.guild_id):
+            return None
+        self._ensure_lyrics()
+        if self.lyrics is None:
+            return "finding lyrics…"
+        if self.lyrics is False:
+            return "no synced lyrics for this track"
+        return extras.lyric_at(self.lyrics, self.source.elapsed + 0.8)[1]
+
+    def _meta(self):
+        bits = []
+        who = getattr(self.source, "requester", None)
+        if who:
+            bits.append(f"🎧 {_safe_name(who)}")
+        fx = guild_setting(self.guild_id, "effect", "off")
+        if fx and fx != "off" and not getattr(self.source, "game", False):
+            bits.append("🎛 " + fx.replace("speed:", "speed x"))
+        return " · ".join(bits) or None
+
+    def _interval(self):
+        return min(NP_INTERVAL, 2.0) if (self.lyrics and lyrics_enabled(self.guild_id)) else NP_INTERVAL
+
+    async def _record_play(self):
+        src = self.source
+        if getattr(src, "game", False) or not self.title:
+            return
+        seconds = max(0.0, getattr(src, "elapsed", 0.0) - self._start_pos)
+        try:
+            await asyncio.to_thread(extras.record_play, DATA, self.guild_id, self.title,
+                                    getattr(src, "video_id", None), getattr(src, "requester", None), seconds)
+        except Exception as e:
+            print(f"⚠️ could not record play: {e}")
+
+    def _text(self, paused=False, ended=False):
+        levels = ends_at = None
+        if not (paused or ended):
+            if NP_REACTIVE and hasattr(self.source, "spectrum"):
+                levels = self.source.spectrum(vapor.NP_BAR_WIDTH)
+            if NP_COUNTDOWN and self.duration:
+                ends_at = time.time() + max(0.0, self.duration - self.source.elapsed) / (getattr(self.source, "speed", 1.0) or 1.0)
+        return vapor.now_playing_live(self.title, self.source.elapsed, self.duration, cached=self.cached,
+                                      paused=paused, ended=ended, levels=levels, ends_at=ends_at,
+                                      hint=f"⏪⏩ {SEEK_STEP}s" if self.view is not None else None,
+                                      lyric=None if ended else self._lyric_row(), meta=self._meta())
+
+    def _is_paused(self):
+        vc = _voice_client_for(self.guild_id)
+        return bool(vc and vc.is_paused())
+
+    async def _edit(self, text, final=False):
+        try:
+            body = await self.header.sync(getattr(self.message, "channel", None), text)
+            kwargs = {}
+            if self.view is not None:
+                if final:
+                    kwargs["view"] = None  # buttons go away with the track
+                    self.view.stop()
+                else:
+                    self.view.sync(self._is_paused(), self.source.elapsed, get_volume(self.guild_id))
+                    kwargs["view"] = self.view
+            if self.embed is not None:
+                self.embed.description = body
+                await self.message.edit(embed=self.embed, **kwargs)
+            else:
+                await self.message.edit(content=body, **kwargs)
+        except discord.NotFound:
+            self._dead = True  # message was deleted: stop bothering
+        except discord.HTTPException:
+            pass  # rate limit / transient: the next tick fixes it
+
+    def start(self):
+        self._task = asyncio.get_running_loop().create_task(self._run())
+
+    async def _run(self):
+        last_edit = time.time()
+        shown_paused = False
+        if self.view is not None:
+            await self._edit(self._text())  # attaches the buttons
+            last_edit = time.time()
+        while not self._stop_event.is_set() and not self._dead:
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=NP_TICK)
+                break
+            except asyncio.TimeoutError:
+                pass
+            if current_sources.get(self.guild_id) is not self.source:
+                break  # finished, skipped, or stopped
+            paused = self._is_paused()
+            forced, self.force = self.force, False
+            if not forced:
+                if paused:
+                    if shown_paused:
+                        continue  # nothing is moving: don't spend edits on a frozen bar
+                elif time.time() - last_edit < self._interval() and not shown_paused:
+                    continue
+            shown_paused = paused
+            last_edit = time.time()
+            await self._edit(self._text(paused=paused))
+        if not self._dead:
+            await self._edit(self._text(ended=True), final=True)  # final, static state
+        await self._record_play()
+        await update_presence()
+
+    async def stop(self):
+        """End tracking now (the final edit is made by the loop). Safe to call repeatedly."""
+        self._stop_event.set()
+        if self._task is not None:
+            try:
+                await self._task
+            except Exception:
+                pass
+
+
+async def track_now_playing(guild_id, message, title, duration=0, cached=False, embed=None, header=None):
+    """
+    Start live progress for the track now playing in this guild. `message` is the (already sent)
+    now-playing message; pass `embed` when the frame lives in that embed's description, otherwise
+    the message content is edited. `header` is the BadgeHeader sitting above that message.
+    Replaces (and finishes) any previous tracker for the guild.
+    """
+    old = _np_trackers.pop(guild_id, None)
+    if old is not None:
+        await old.stop()
+    source = current_sources.get(guild_id)
+    if source is not None:
+        apply_saved_volume(guild_id, source)
+    await update_presence()
+    if not NP_LIVE_ENABLED or message is None or source is None or not hasattr(source, "elapsed"):
+        return None
+    tracker = NowPlayingTracker(guild_id, source, message, embed, header if header is not None else BadgeHeader(),
+                                title, duration, cached)
+    _np_trackers[guild_id] = tracker
+    tracker.start()
+    return tracker
+
+
+async def send_now_playing(channel, embed, source, guild_id, title, duration=0, cached=False, cover_path=None):
+    """Send the GIF badge, then the now-playing embed right under it, and start its live progress."""
+    text = now_playing_text(source, title, duration, cached)
+    header = BadgeHeader()
+    header.cover = load_cover(cover_path)
+    if BADGES_ENABLED:
+        embed.color = discord.Color(gif_art.style_embed_color(gif_art.effective_style(style_for(guild_id), header.cover)))
+    embed.description = await header.sync(channel, text)
+    msg = await channel.send(embed=embed)
+    await track_now_playing(guild_id, msg, title, duration, cached, embed=embed, header=header)
+    return msg
+
+
+def now_playing_text(source, title, duration, cached=False):
+    """First frame of the now-playing message (0:00 and an empty bar, or the live one if disabled)."""
+    if NP_LIVE_ENABLED:
+        return vapor.now_playing_live(title, getattr(source, "elapsed", 0), duration, cached=cached)
+    duration_str = f" • {duration//60}:{duration%60:02d}" if duration else ""
+    return vapor.now_playing(title, duration_str, cached)
+
 
 @bot.command(name="test", help="Test if bot is responding to commands")
 async def test(ctx):
@@ -1579,6 +3678,10 @@ async def summon(ctx):
         return
 
     channel = ctx.author.voice.channel
+    if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+        await ctx.send("❌ Join a voice or stage channel first.")
+        return
+
     voice_client = ctx.guild.voice_client
     print(f"🎯 Target channel: {channel.name} (ID: {channel.id})")
 
@@ -1595,65 +3698,64 @@ async def summon(ctx):
         await ctx.send(f"⚠️ I can connect but won't be able to play audio (missing 'Speak' permission)")
         print(f"⚠️ Missing 'Speak' permission for {channel.name} in {ctx.guild.name}")
 
-    if voice_client:
-        if voice_client.channel == channel:
-            await ctx.send(f"🔊 I'm already connected to **{channel.name}**!")
-            return
-        else:
-            try:
-                await voice_client.disconnect()
-                await asyncio.sleep(0.5)  # Small delay after disconnect
-            except Exception as disconnect_error:
-                print(f"⚠️ Error disconnecting from previous channel: {disconnect_error}")
+    if (
+        voice_client
+        and voice_client.channel == channel
+        and _voice_session_usable(voice_client)
+    ):
+        await ctx.send(f"🔊 I'm already connected to **{channel.name}**!")
+        return
 
+    anim = None
     try:
-        connecting_msg = await ctx.send(f"🎵 Connecting to **{channel.name}**...")
+        connecting_msg, anim = await _start_summon_animation(ctx, channel.name)
         print(f"🔄 Attempting to connect to voice channel: {channel.name} (ID: {channel.id}) in {ctx.guild.name}")
         print(f"   Channel type: {type(channel).__name__}")
         print(f"   Guild ID: {ctx.guild.id}")
         print(f"   Bot user: {ctx.guild.me.name} (ID: {ctx.guild.me.id})")
         
-        # Check if bot is already connected somewhere
         if ctx.guild.voice_client:
             print(f"   Existing voice client found: {ctx.guild.voice_client}")
             print(f"   Existing connection status: {ctx.guild.voice_client.is_connected()}")
         
-        # Try connecting with timeout
-        print(f"   Starting connection attempt...")
+        print(f"   Starting connection attempt (serialized per guild)...")
         try:
-            voice_client = await asyncio.wait_for(
-                channel.connect(timeout=10.0, reconnect=True, self_deaf=False, self_mute=False),
-                timeout=20.0  # Increased timeout
+            voice_client = await connect_to_voice_channel(
+                ctx.guild, channel, timeout=40.0
             )
-            print(f"   Connection call completed, got voice_client: {voice_client}")
+            print(f"   Connection completed, got voice_client: {voice_client}")
         except asyncio.TimeoutError as timeout_err:
-            print(f"❌ Connection timeout during asyncio.wait_for: {timeout_err}")
+            print(f"❌ Connection timeout: {timeout_err}")
             raise
         except Exception as connect_err:
-            print(f"❌ Error during channel.connect(): {type(connect_err).__name__}: {connect_err}")
+            print(f"❌ Error during connect_to_voice_channel: {type(connect_err).__name__}: {connect_err}")
             raise
         
-        # Verify connection immediately
         print(f"   Verifying connection...")
-        print(f"   voice_client object: {voice_client}")
         print(f"   voice_client.is_connected(): {voice_client.is_connected() if voice_client else 'N/A'}")
         print(f"   voice_client.channel: {voice_client.channel if voice_client else 'N/A'}")
         
-        await asyncio.sleep(1.0)  # Give it more time to establish
+        if voice_client:
+            await _await_voice_connected(voice_client, 5.0)
+        await asyncio.sleep(0.5)
         
-        # Check again after delay
-        is_connected = voice_client.is_connected() if voice_client else False
-        print(f"   After delay - is_connected: {is_connected}")
+        is_connected = _voice_session_usable(voice_client) if voice_client else False
+        print(f"   After short wait - is_connected: {is_connected}")
         
         if voice_client and is_connected:
-            await connecting_msg.edit(content=f"🔊 **Connected** to **{channel.name}**!")
+            await _finish_summon(connecting_msg, anim, f"🔊 **Connected** to **{channel.name}**!")
+            if DASHBOARD_ON_SUMMON:
+                try:
+                    set_notification_channel(ctx.guild.id, ctx.channel)
+                    await post_dashboard(ctx)
+                except Exception as e:
+                    print(f"⚠️ dashboard failed: {e}")
             print(f"✅ Successfully connected to {channel.name} in {ctx.guild.name}")
             print(f"   Voice client channel: {voice_client.channel.name if voice_client.channel else 'None'}")
         else:
             error_details = f"Voice client exists: {voice_client is not None}, Connected: {is_connected}"
-            await connecting_msg.edit(content=f"⚠️ Connection issue: {error_details}\n💡 Try `!diagnose` to check status.")
+            await _finish_summon(connecting_msg, anim, f"⚠️ Connection issue: {error_details}\n💡 Try `!diagnose` to check status.")
             print(f"⚠️ Connection to {channel.name} failed verification: {error_details}")
-            # Try to get more info
             if voice_client:
                 print(f"   Voice client state: {voice_client}")
                 print(f"   Voice client endpoint: {getattr(voice_client, 'endpoint', 'N/A')}")
@@ -1698,60 +3800,61 @@ async def summon(ctx):
         import traceback
         traceback.print_exc()
 
+    finally:
+        # Any failure path above: stop the donut right away and don't leave it frozen mid-spin
+        if anim is not None:
+            await anim.stop("❌ **Connection failed**", respect_min=False)
+
 @bot.command(name="play", help="Stream audio content")
 @require_authorization()
 async def play(ctx, *, query: str):
     """Stream audio content from query"""
-    
+    query = _sanitize_user_query(query)
+    if not query:
+        await ctx.send("❌ Add a song name or link after `!play`.")
+        return
+
+    # Dedicated playlist page -> import it (rolling batch download, deleted after play)
+    if _is_playlist_url(query):
+        await _begin_playlist_import(ctx, query)
+        return
+
     # Set notification channel to where the command was issued
     set_notification_channel(ctx.guild.id, ctx.channel)
-        
+
+    if ctx.guild.id in _games:
+        await ctx.send("🎲 A guessing game is running. `!guess stop` ends it first.")
+        return
+    if not getattr(ctx, "autoplay", False):
+        _autoplay_count.pop(ctx.guild.id, None)   # a person asked for something: autoplay's streak restarts
+
     voice_client = ctx.guild.voice_client
-    if not voice_client or not voice_client.is_connected():
+    if not voice_client or not _voice_session_usable(voice_client):
         await ctx.send("❌ I'm not connected to a voice channel! Use `!summon` first.")
         return
 
-    
     try:
-        # Process audio request
-        processing_msg = await ctx.send(f"🔄 **Processing:** `{query}`...")
-        
+        # Process audio request — no fixed deadline: live progress + processor-heartbeat liveness
+        processing_msg = StatusMessage(ctx, vapor.searching())
+        await processing_msg.start()
+
         print(f"📝 Queuing request: {query}")
         request_id = queue_audio_request(query)
-        
-        # Wait for background service to process (with timeout)
-        max_wait = 180  # allow slow yt-dlp / first-time downloads
-        wait_time = 0
-        result = None
-        
-        while wait_time < max_wait:
-            result = check_processing_result(request_id)
-            if result:
-                break
-            
-            await asyncio.sleep(1)
-            wait_time += 1
-            
-            # Update progress every 5 seconds
-            if wait_time % 5 == 0:
-                await processing_msg.edit(content=f"🔄 **Processing:** `{query}` ({wait_time}s)")
-        
-        if not result:
-            await processing_msg.edit(content=f"⏰ **Timeout:** Processing took too long")
-            return
-        
+        result = await wait_for_request(request_id, on_progress=processing_msg.progress_callback(request_id))
+
         if result['status'] != 'success':
-            await processing_msg.edit(content=f"❌ **Error:** {result.get('message', 'Unknown error')}")
+            await processing_msg.edit(content=vapor.error_label(result.get('message', 'Unknown error')))
             return
-        
+
         # Get file path from result
         file_path = result['file_path']
         title = result.get('title', 'Unknown')
         duration = result.get('duration', 0)
         cached = result.get('cached', False)
-        
+        cover_path = result.get('cover_path')
+
         if not os.path.exists(file_path):
-            await processing_msg.edit(content=f"❌ **Error:** File not found")
+            await processing_msg.edit(content=vapor.error_label("File not found"))
             return
         
         # Check if something is already playing - if so, queue this song
@@ -1763,7 +3866,9 @@ async def play(ctx, *, query: str):
                 'file_path': file_path,
                 'duration': duration,
                 'requested_by': ctx.author,
-                'cached': cached
+                'cached': cached,
+                'cover_path': cover_path,
+                'video_id': result.get('video_id'),
             }
             add_to_song_queue(ctx.guild.id, song_info)
             
@@ -1772,19 +3877,12 @@ async def play(ctx, *, query: str):
             duration_str = f" • {duration//60}:{duration%60:02d}" if duration else ""
             cached_str = " (cached)" if cached else ""
             
-            embed = discord.Embed(
-                title="📋 Added to Queue",
-                description=f"**{title}**{duration_str}{cached_str}",
-                color=0x3498db
-            )
-            embed.add_field(name="Position", value=f"#{queue_position}", inline=True)
-            embed.add_field(name="Requested by", value=ctx.author.mention, inline=True)
-            
             queue_info = get_queue_info(ctx.guild.id)
+            detail = f"#{queue_position} in queue" + (f" · {duration//60}:{duration%60:02d}" if duration else "") + (" · cached" if cached else "")
+            lines = [title, detail, f"requested by {ctx.author.display_name}"]
             if len(queue_info) > 1:
-                embed.set_footer(text=f"{len(queue_info)} songs in queue")
-            
-            await processing_msg.edit(content=None, embed=embed)
+                lines.append(f"{len(queue_info)} songs waiting")
+            await processing_msg.edit(content=vapor.note("added to queue", *lines))
             return
         
         # Stream the audio file (nothing is currently playing)
@@ -1796,24 +3894,10 @@ async def play(ctx, *, query: str):
         print(f"🔍 File exists: {os.path.exists(file_path)}")
         print(f"🔍 File size: {os.path.getsize(file_path) if os.path.exists(file_path) else 'N/A'} bytes")
         
-        # Test the file with FFmpeg manually first
-        try:
-            import subprocess
-            test_cmd = ['ffmpeg', '-i', file_path, '-t', '5', '-f', 'null', '-']
-            print(f"🔍 Testing file with command: {' '.join(test_cmd)}")
-            result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=15)
-            print(f"🔍 FFmpeg test return code: {result.returncode}")
-            if result.returncode != 0:
-                print(f"⚠️ FFmpeg test stderr: {result.stderr[:200]}")
-            else:
-                print(f"✅ FFmpeg test passed!")
-        except Exception as test_error:
-            print(f"⚠️ FFmpeg test failed: {test_error}")
         
-        source = discord.FFmpegPCMAudio(file_path, executable=get_ffmpeg_path(), **ffmpeg_options)
-        print(f"✅ Created FFmpegPCMAudio source")
-        
-        audio_source = SimpleAudioSource(source, title=title, duration=duration, file_path=file_path)
+        audio_source = make_audio_source(ctx.guild.id, file_path, title=title, duration=duration,
+                                         requester=_who(ctx.author), video_id=result.get('video_id'))
+        print(f"✅ Created audio source")
         
         # Track for cleanup
         current_sources[ctx.guild.id] = audio_source
@@ -1824,13 +3908,13 @@ async def play(ctx, *, query: str):
         # Verify playback started
         await asyncio.sleep(0.5)
         if voice_client.is_playing():
-            duration_str = f" • {duration//60}:{duration%60:02d}" if duration else ""
-            cached_str = " (cached)" if cached else ""
-            
-            await processing_msg.edit(content=f"🎵 **Now streaming:** {title}{duration_str}{cached_str}")
+            processing_msg._header.cover = load_cover(cover_path)  # pixel-art thumbnail on the badge
+            await processing_msg.edit(content=now_playing_text(audio_source, title, duration, cached))
+            await track_now_playing(ctx.guild.id, processing_msg.msg, title, duration, cached,
+                                    header=processing_msg._header)
             print(f"✅ Successfully streaming: {title}")
         else:
-            await processing_msg.edit(content=f"❌ **Failed to start streaming**")
+            await processing_msg.edit(content=vapor.error_label("failed to start streaming"))
             print(f"❌ Streaming failed for: {title}")
             
     except Exception as e:
@@ -1843,51 +3927,22 @@ async def play(ctx, *, query: str):
 @bot.command(name="pause", help="Pause audio stream")
 async def pause(ctx):
     """Pause current stream"""
-    if ctx.guild.voice_client and ctx.guild.voice_client.is_playing():
-        ctx.guild.voice_client.pause()
-        await ctx.send("⏸️ **Paused**")
+    ok, text = pause_current(ctx.guild.id)
+    if ok:
+        src = current_sources.get(ctx.guild.id)
+        await reply_note(ctx, vapor.note("paused", getattr(src, "title", "") or "playback paused"))
     else:
-        await ctx.send("❌ Nothing playing")
+        await ctx.send(f"❌ {text}")
 
 @bot.command(name="resume", help="Resume audio stream")
 async def resume(ctx):
     """Resume stream"""
-    if ctx.guild.voice_client and ctx.guild.voice_client.is_paused():
-        ctx.guild.voice_client.resume()
-        await ctx.send("▶️ **Resumed**")
+    ok, text = resume_current(ctx.guild.id)
+    if ok:
+        src = current_sources.get(ctx.guild.id)
+        await reply_note(ctx, vapor.note("resumed", getattr(src, "title", "") or "playback resumed"))
     else:
-        await ctx.send("❌ Nothing paused")
-
-@bot.command(name="queue", help="Show current song queue")
-async def show_queue(ctx):
-    """Show the current song queue"""
-    queue_info = get_queue_info(ctx.guild.id)
-    
-    if not queue_info:
-        await ctx.send("📋 The queue is empty!")
-        return
-    
-    embed = discord.Embed(
-        title="📋 Current Song Queue",
-        description=f"{len(queue_info)} songs in queue",
-        color=0x3498db
-    )
-    
-    # Show up to 10 songs in queue
-    for i, song in enumerate(queue_info[:10], 1):
-        duration_str = f" • {song['duration']//60}:{song['duration']%60:02d}" if song['duration'] else ""
-        cached_str = " (cached)" if song['cached'] else ""
-        
-        embed.add_field(
-            name=f"{i}. {song['title']}{duration_str}{cached_str}",
-            value=f"Requested by {song['requested_by'].mention}",
-            inline=False
-        )
-    
-    if len(queue_info) > 10:
-        embed.set_footer(text=f"... and {len(queue_info) - 10} more songs")
-    
-    await ctx.send(embed=embed)
+        await ctx.send(f"❌ {text}")
 
 @bot.command(name="clearqueue", help="Clear the song queue")
 @require_authorization()
@@ -1910,72 +3965,139 @@ async def clear_queue(ctx):
 async def skip_track(ctx):
     """Skip current track; continues active playlist or advances !play queue."""
     set_notification_channel(ctx.guild.id, ctx.channel)
-    vc = ctx.guild.voice_client
-    if not vc or not vc.is_connected():
-        await ctx.send("❌ I'm not connected to a voice channel.")
-        return
-    if not (vc.is_playing() or vc.is_paused()):
-        await ctx.send("❌ Nothing playing")
-        return
-    
-    if PlaylistManager.get_playlist_status(ctx.guild.id)["status"] == "active":
-        result = PlaylistManager.skip_song(ctx.guild.id, "next")
-        if result["status"] != "success":
-            await ctx.send(f"❌ {result['message']}")
-            return
-        playlist_force_after_stop.add(ctx.guild.id)
-        vc.stop()
-        await ctx.send(f"⏭️ {result['message']}")
-        return
-    
-    if song_queues.get(ctx.guild.id):
-        vc.stop()
-        await ctx.send("⏭️ Skipped — playing next in queue")
-        return
-    
-    vc.stop()
-    await ctx.send("⏭️ Stopped")
+    ok, text = skip_current(ctx.guild.id)
+    if ok:
+        await reply_note(ctx, vapor.note("skipped", text.replace("**", "")))
+    else:
+        await ctx.send(f"❌ {text}")
 
 @bot.command(name="stop", help="Stop audio stream")
 async def stop(ctx):
-    """Stop current stream"""
-    if ctx.guild.voice_client:
-        if ctx.guild.voice_client.is_playing() or ctx.guild.voice_client.is_paused():
-            # Queue cleanup of any active files before stopping
-            source = current_sources.get(ctx.guild.id)
-            if source and hasattr(source, 'file_path') and source.file_path:
-                queue_cleanup_request(source.file_path)
-            
-            ctx.guild.voice_client.stop()
-            current_sources.pop(ctx.guild.id, None)
-            
-            # Also clear the song queue when stopping
-            queue_count = clear_song_queue(ctx.guild.id)
-            if queue_count > 0:
-                await ctx.send(f"⏹️ **Stopped** (cleared {queue_count} queued songs)")
-            else:
-                await ctx.send("⏹️ **Stopped**")
-        else:
-            await ctx.send("❌ Nothing playing")
+    """Stop current stream (and end any active playlist so it doesn't advance to the next track)"""
+    ok, text = stop_current(ctx.guild.id)
+    await ctx.send(text if ok else f"❌ {text}")
+
+@bot.command(name="volume", aliases=["vol"], help="Show or set the volume (0-200, or +10 / -10)")
+@require_authorization()
+async def volume_cmd(ctx, level: str = None):
+    """!volume -> show, !volume 60 -> set, !volume +10 / -10 -> nudge"""
+    gid = ctx.guild.id
+    if level is None:
+        await reply_note(ctx, vapor.volume_note(int(round(get_volume(gid) * 100))))
+        return
+    txt = level.strip().rstrip("%")
+    try:
+        value = float(txt)
+    except ValueError:
+        await ctx.send("❌ Usage: `!volume <0-200>` or `!volume +10` / `!volume -10`")
+        return
+    current = get_volume(gid) * 100
+    pct = set_volume(gid, current + value if txt[:1] in "+-" else value)
+    await reply_note(ctx, vapor.volume_note(pct))
+
+@bot.command(name="mute", aliases=["unmute"], help="Mute / unmute the bot (remembers the volume)")
+@require_authorization()
+async def mute_cmd(ctx):
+    muted, pct = toggle_mute(ctx.guild.id)
+    await reply_note(ctx, vapor.volume_note(pct))
+    tracker = _np_trackers.get(ctx.guild.id)
+    if tracker is not None:
+        tracker.force = True
+
+async def _seek_reply(ctx, ok, info):
+    if ok:
+        frm, to, dur = info
+        await reply_note(ctx, vapor.seek_note(frm, to, dur))
     else:
-        await ctx.send("❌ Not connected")
+        await ctx.send(f"❌ {info}")
+
+@bot.command(name="seek", help="Jump to a time in the current song (1:30, 90, +30, -15)")
+@require_authorization()
+async def seek_cmd(ctx, *, position: str = None):
+    try:
+        mode, secs = parse_seek(position)
+    except ValueError as e:
+        await ctx.send(f"❌ {e}. Examples: `!seek 1:30`, `!seek +30`, `!seek -15`")
+        return
+    ok, info = seek_current(ctx.guild.id, **{mode: secs})
+    await _seek_reply(ctx, ok, info)
+
+@bot.command(name="forward", aliases=["ff"], help="Skip ahead in the current song (default 10s)")
+@require_authorization()
+async def forward_cmd(ctx, seconds: str = None):
+    try:
+        secs = _parse_clock(seconds) if seconds else SEEK_STEP
+    except ValueError as e:
+        await ctx.send(f"❌ {e}")
+        return
+    ok, info = seek_current(ctx.guild.id, by=secs)
+    await _seek_reply(ctx, ok, info)
+
+@bot.command(name="rewind", aliases=["rw"], help="Go back in the current song (default 10s)")
+@require_authorization()
+async def rewind_cmd(ctx, seconds: str = None):
+    try:
+        secs = _parse_clock(seconds) if seconds else SEEK_STEP
+    except ValueError as e:
+        await ctx.send(f"❌ {e}")
+        return
+    ok, info = seek_current(ctx.guild.id, by=-secs)
+    await _seek_reply(ctx, ok, info)
+
+@bot.command(name="style", help="Change the look of the animated badges (vaporwave, matrix, sunset, synthwave, auto)")
+@require_authorization()
+async def style_cmd(ctx, name: str = None):
+    names = gif_art.style_names() + ("auto",)   # "auto": colours follow each song's cover art
+    current = style_for(ctx.guild.id)
+    if name is None:
+        await reply_note(ctx, vapor.note("style", f"current: {current}", "options: " + ", ".join(names)))
+        return
+    choice = name.strip().lower()
+    if choice not in names:
+        await ctx.send("❌ Unknown style. Options: " + ", ".join(f"`{n}`" for n in names))
+        return
+    set_guild_setting(ctx.guild.id, "style", choice)
+    if choice != "auto":
+        asyncio.get_running_loop().run_in_executor(None, gif_art.prewarm, choice)  # build its GIFs in the background
+    await reply_note(ctx, vapor.note("style", f"style set to {choice}",
+                                     *(["colours follow each song's cover art"] if choice == "auto" else [])))
 
 @bot.command(name="kill", help="Disconnect the bot from voice channel")
 async def kill(ctx):
     """Disconnect from voice channel"""
     if ctx.guild.voice_client:
+        try:
+            snapshot_session(ctx.guild.id)
+        except Exception as e:
+            print(f"⚠️ session snapshot failed: {e}")
+        # End any playlist first so stopping playback can't advance it (and prefetching stops)
+        PlaylistManager.stop_playlist(ctx.guild.id)
+
         # Queue cleanup of any active files before disconnecting
         source = current_sources.get(ctx.guild.id)
         if source and hasattr(source, 'file_path') and source.file_path:
-            queue_cleanup_request(source.file_path)
-        
+            if not str(source.file_path).startswith('playlists'):
+                queue_cleanup_request(source.file_path)
+
         # Stop any playback
+        _sleep_cancel(ctx.guild.id)
+        _autoplay_count.pop(ctx.guild.id, None)
+        game = _games.get(ctx.guild.id)
+        if game is not None:
+            game.stopping = True
+            game.skip.set()
+            game.answered.set()
         if ctx.guild.voice_client.is_playing() or ctx.guild.voice_client.is_paused():
+            _no_autoplay.add(ctx.guild.id)
             ctx.guild.voice_client.stop()
-        
+
         current_sources.pop(ctx.guild.id, None)
         await ctx.guild.voice_client.disconnect()
-        await ctx.send("👋 **Disconnected**")
+        scene = await _scene_file(("shutdown", None), style_for(ctx.guild.id)) if BADGES_ENABLED else None
+        if scene is not None:
+            await ctx.send("👋 **Disconnected**", file=scene)
+        else:
+            await ctx.send("👋 **Disconnected**")
     else:
         await ctx.send("❌ Not connected")
 
@@ -1994,6 +4116,10 @@ async def show_commands(ctx):
             "`!play <search or url>` - Stream audio content (auto-queues if busy)\n"
             "`!pause` - Pause the current song\n"
             "`!resume` - Resume playback\n"
+            "`!skip` - Skip to the next track ⏭️\n"
+            "`!seek <1:30 | +30 | -15>` / `!forward [s]` / `!rewind [s]` - Jump around in the song ⏩\n"
+            "`!volume [0-200 | +10 | -10]` / `!mute` - Show or set the volume, or mute 🔊\n"
+            "`!style [name]` - Badge look: vaporwave, matrix, sunset, synthwave, auto 🎨\n"
             "`!stop` - Stop current song (bot stays in channel)\n"
             "`!queue` - Show current song queue 📋\n"
             "`!clearqueue` - Clear all queued songs 🗑️"
@@ -2066,6 +4192,24 @@ async def show_commands(ctx):
         inline=False
     )
     
+    embed.add_field(
+        name="✨ Extras",
+        value=(
+            "`!effect [slowed|vaporwave|nightcore|reverb|bass|8d|speed 1.25|off]` 🎛️\n"
+            "`!fade [seconds|off]` - Fade songs in and out\n"
+            "`!sleep [30m|1h30m|end|off]` - Sleep timer 😴\n"
+            "`!queue` - Interactive queue (move, play now, remove)\n"
+            "`!voteskip` / 🗳️ - Vote to skip (majority of listeners)\n"
+            "`!like` `!likes [play|remove N]` `!history` - Favourites & history ❤️\n"
+            "`!lyrics [on|off|full]` - Live lyrics under the bar 🎤\n"
+            "`!autoplay [on|off]` - Keep similar songs coming 📻\n"
+            "`!guess [rounds] [playlist url]` - Guess-the-song game 🎲\n"
+            "`!stats [day|week|month|all]` - Listening stats 📊\n"
+            "`!dashboard` - Home panel: resume last session, favourites, radio, quick settings 🏠"
+        ),
+        inline=False
+    )
+
     embed.set_footer(text="Use !commands to see this message anytime • Made with ❤️")
     await ctx.send(embed=embed)
 
@@ -2342,7 +4486,7 @@ async def playlist_cmd(ctx, action=None, *, args=None):
     """Air-gap safe playlist management - only uses local files"""
     
     # Set notification channel for playlist notifications
-    if action in ["play", "next", "prev", "shuffle", "loop"]:
+    if action in ["play", "next", "prev", "shuffle", "loop", "import"]:
         set_notification_channel(ctx.guild.id, ctx.channel)
     
     if not action:
@@ -2360,6 +4504,7 @@ async def playlist_cmd(ctx, action=None, *, args=None):
                 "`!playlist add <name>` - Add currently playing song\n"
                 "`!playlist show <name>` - Show playlist contents\n"
                 "`!playlist clean <name>` - Remove missing files from playlist\n"
+                "`!playlist import <youtube url> [keep] [shuffle] [name]` - Import a YouTube playlist (deleted after play unless `keep`)\n"
                 "`!playlist media` - Show available local media files"
             ),
             inline=False
@@ -2536,17 +4681,10 @@ async def playlist_cmd(ctx, action=None, *, args=None):
                 # Simple path normalization for FFmpeg
                 
                 # Use FFmpegPCMAudio with explicit FFmpeg path - Discord.py handles Opus encoding internally
-                source = discord.FFmpegPCMAudio(audio_path, executable=get_ffmpeg_path(), **ffmpeg_options)
-                print(f"✅ Created FFmpegPCMAudio source for playlist")
-                
-                print(f"✅ FFmpeg source created successfully")
-                
-                audio_source = SimpleAudioSource(
-                    source,
-                    title=first_song.get("title", "Unknown"),
-                    duration=first_song.get("duration", 0),
-                    file_path=str(audio_file)
-                )
+                audio_source = make_audio_source(ctx.guild.id, audio_file, title=first_song.get("title", "Unknown"),
+                                                 duration=first_song.get("duration", 0),
+                                                 video_id=first_song.get("video_id"))
+                print(f"✅ Created audio source for playlist")
                 print(f"✅ Audio source created successfully")
                 
                 current_sources[ctx.guild.id] = audio_source
@@ -2574,7 +4712,6 @@ async def playlist_cmd(ctx, action=None, *, args=None):
             # Send confirmation
             embed = discord.Embed(
                 title="🎵 Started Playlist Playback!",
-                description=f"**{first_song.get('title', 'Unknown')}**",
                 color=0x9c27b0
             )
             embed.add_field(name="Playlist", value=f"🎵 {playlist_name}", inline=True)
@@ -2584,10 +4721,24 @@ async def playlist_cmd(ctx, action=None, *, args=None):
                 embed.add_field(name="Duration", value=f"⏱️ {duration_str}", inline=True)
             
             embed.set_footer(text="Songs will play automatically • Use !playlist stop to end")
-            await ctx.send(embed=embed)
+            await send_now_playing(ctx, embed, audio_source, ctx.guild.id,
+                                   first_song.get('title', 'Unknown'), first_song.get('duration', 0))
         else:
             await ctx.send(f"❌ {result['message']}")
     
+    elif action.lower() == "import":
+        if not args:
+            await ctx.send("❌ Usage: `!playlist import <youtube playlist url> [keep] [shuffle] [name]`\n"
+                           "Tracks are deleted after they play unless you add `keep`.")
+            return
+        tokens = args.split()
+        import_url = tokens[0]
+        rest = tokens[1:]
+        keep_flag = any(t.lower() == "keep" for t in rest)
+        shuffle_flag = any(t.lower() == "shuffle" for t in rest)
+        import_name = " ".join(t for t in rest if t.lower() not in ("keep", "shuffle")).strip() or None
+        await _begin_playlist_import(ctx, import_url, keep=keep_flag, shuffle=shuffle_flag, custom_name=import_name)
+
     elif action.lower() == "stop":
         result = PlaylistManager.stop_playlist(ctx.guild.id)
         
@@ -2713,12 +4864,7 @@ async def playlist_cmd(ctx, action=None, *, args=None):
         result = PlaylistManager.shuffle_playlist(ctx.guild.id)
         
         if result["status"] == "success":
-            embed = discord.Embed(
-                title="🔀 Shuffle Toggle",
-                description=result["message"],
-                color=0xff9800
-            )
-            await ctx.send(embed=embed)
+            await reply_note(ctx, vapor.note("shuffled", str(result["message"]).replace("**", "")))
         else:
             await ctx.send(f"❌ {result['message']}")
     
@@ -3320,6 +5466,1401 @@ async def voice_region(ctx):
     embed.set_footer(text="Region changes require server administrator permissions")
     await ctx.send(embed=embed)
 
+# ============================================================================
+# ✨ EXTRAS — audio effects, fade, sleep timer, interactive queue, vote skip, stats + weekly recap,
+#    favourites / history, live lyrics, autoplay radio and a "guess the song" game.
+#    Pure logic lives in gondor_extras.py. Anything needing the network (lyrics, related tracks)
+#    goes through the audio processor like every download does: the bot itself never touches the net.
+# ============================================================================
+
+DATA = extras.JsonStore(Path(os.environ.get("GONDOR_DATA_FILE") or (Path(__file__).resolve().parent / "gondor_data.json")))
+AUTOPLAY_MAX = max(1, int(os.environ.get("GONDOR_AUTOPLAY_MAX", "25")))   # songs in a row without a human request
+RECAP_ENABLED = _env_flag("GONDOR_RECAP")             # weekly "what did we listen to" post
+LYRICS_ENABLED = _env_flag("GONDOR_LYRICS")           # master switch for lyric lookups
+GUESS_CLIP_SECONDS = 12
+GUESS_ROUND_SECONDS = 35                               # time to answer, counted from the start of the clip
+SLEEP_FADE_SECONDS = 15
+RECAP_EVERY = 7 * 24 * 3600
+QUEUE_PAGE = 8
+
+_no_autoplay = set()      # guilds where the playback that is ending was stopped on purpose (!stop, !kill, sleep)
+_autoplay_busy = set()
+_autoplay_count = {}      # guild_id -> songs played by autoplay since a person last asked for something
+_skip_votes = {}          # guild_id -> (id(source), {user ids})
+_sleep_state = {}         # guild_id -> {"mode": "timer" | "end", "ends": unix time, "task": asyncio.Task | None}
+_games = {}               # guild_id -> GuessGame
+_lyrics_cache = OrderedDict()
+
+
+def _safe_name(name, limit=24):
+    """A display name that is safe to print outside a code block (no pings, no markdown)."""
+    text = discord.utils.escape_markdown(discord.utils.escape_mentions(str(name or "")))
+    return " ".join(text.split())[:limit]
+
+
+def _who(user):
+    return getattr(user, "display_name", None) or getattr(user, "name", None)
+
+
+def queue_info_request(kind, **fields):
+    """Queue a non-download request for the processor ('lyrics', 'related')."""
+    rid = str(uuid.uuid4())[:8]
+    data = {"type": kind, "request_id": rid, "timestamp": time.time(), "lane": "foreground", **fields}
+    _write_json_atomic(QUEUE_DIR / f"request_{rid}.json", data)
+    return rid
+
+
+class PseudoCtx:
+    """Just enough of a commands.Context for calling a command's callback from a button / the autoplay loop."""
+
+    def __init__(self, guild, channel, author, autoplay=False):
+        self.guild, self.channel, self.author = guild, channel, author
+        self.autoplay = autoplay
+        self.bot, self.message, self.command = bot, None, None
+        self.me = guild.me
+        self.voice_client = guild.voice_client
+
+    async def send(self, *args, **kwargs):
+        return await self.channel.send(*args, **kwargs)
+
+
+def _youtube_ref(item):
+    vid = item.get("vid")
+    return f"https://www.youtube.com/watch?v={vid}" if vid else item.get("title", "")
+
+
+def _play_impl():
+    """`!play` without its whitelist wrapper: the callers (menus, autoplay) do their own permission checks."""
+    return getattr(play.callback, "__wrapped__", play.callback)
+
+
+async def queue_track(pctx, item):
+    """Queue/play one remembered track exactly like `!play` would."""
+    await _play_impl()(pctx, query=_youtube_ref(item))
+
+
+# ---------------------------------------------------------------------------
+# Effects, fade
+# ---------------------------------------------------------------------------
+
+def guild_effect(guild_id):
+    return extras.effect_by_key(guild_setting(guild_id, "effect", "off") or "off")
+
+
+def guild_fade(guild_id):
+    try:
+        return max(0.0, min(12.0, float(guild_setting(guild_id, "fade", 0) or 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def make_audio_source(guild_id, path, *, title, duration=0, requester=None, video_id=None, start_offset=0.0,
+                      volume=None, clip_seconds=None, game=False):
+    """
+    The one place playback sources are built: applies the server's sound effect (ffmpeg filter + the speed
+    it implies), the fade setting, a start position and who asked for the track.
+    """
+    flt, speed = ("", 1.0) if game else guild_effect(guild_id)
+    opts = dict(ffmpeg_options)
+    before = opts.get("before_options", "")
+    if start_offset:
+        before = f"{before} -ss {float(start_offset):.2f}".strip()
+    out = opts["options"]
+    if flt:
+        out += f' -af "{flt}"'
+    if clip_seconds:
+        out += f" -t {clip_seconds:g}"
+    opts["before_options"], opts["options"] = before, out
+    ff = discord.FFmpegPCMAudio(str(path).replace("\\", "/"), executable=get_ffmpeg_path(), **opts)
+    return SimpleAudioSource(ff, title=title, duration=duration, file_path=str(path), start_offset=start_offset,
+                             volume=volume, speed=speed, requester=requester, video_id=video_id,
+                             fade=0.0 if game else guild_fade(guild_id), game=game)
+
+
+@bot.command(name="effect", aliases=["fx"], help="Sound effect: slowed, vaporwave, nightcore, reverb, bass, 8d, speed 1.25, off")
+@require_authorization()
+async def effect_cmd(ctx, *, spec: str = None):
+    gid = ctx.guild.id
+    current = guild_setting(gid, "effect", "off") or "off"
+    if spec is None:
+        await reply_note(ctx, vapor.note("effect", f"current: {current}",
+                                         "options: " + ", ".join(extras.effect_names()) + ", speed 1.25"))
+        return
+    try:
+        desc, live = apply_effect(gid, spec)
+    except ValueError as e:
+        await ctx.send(f"❌ {e}")
+        return
+    await reply_note(ctx, vapor.note("effect", desc, "applied to the song playing now" if live else "applies from the next song"))
+
+
+@bot.command(name="fade", help="Fade songs in and out (seconds, or off)")
+@require_authorization()
+async def fade_cmd(ctx, seconds: str = None):
+    gid = ctx.guild.id
+    if seconds is None:
+        cur = guild_fade(gid)
+        await reply_note(ctx, vapor.note("fade", f"fade: {cur:g}s" if cur else "fade: off",
+                                         "each song fades in and out; use `!fade 4` or `!fade off`"))
+        return
+    text = seconds.strip().lower().rstrip("s")
+    if text in ("off", "0", "no", "none"):
+        value = 0.0
+    else:
+        try:
+            value = float(text)
+        except ValueError:
+            await ctx.send("❌ Use a number of seconds (1-12) or `off`.")
+            return
+        if not 0.5 <= value <= 12:
+            await ctx.send("❌ Fade must be between 0.5 and 12 seconds (or `off`).")
+            return
+    set_guild_setting(gid, "fade", value)
+    src = current_sources.get(gid)
+    if src is not None and hasattr(src, "fade") and not getattr(src, "game", False):
+        src.fade = value
+    await reply_note(ctx, vapor.note("fade", f"fade set to {value:g}s" if value else "fade is off",
+                                     "songs fade out at the end and the next fades in"))
+
+
+# ---------------------------------------------------------------------------
+# Sleep timer
+# ---------------------------------------------------------------------------
+
+def _sleep_cancel(guild_id):
+    st = _sleep_state.pop(guild_id, None)
+    if st and st.get("task") is not None:
+        st["task"].cancel()
+    return st is not None
+
+
+async def _sleep_finish(guild_id, why):
+    _sleep_state.pop(guild_id, None)
+    if PlaylistManager.get_playlist_status(guild_id)["status"] == "active":
+        PlaylistManager.stop_playlist(guild_id)
+    clear_song_queue(guild_id)
+    stop_current(guild_id)
+    for src in list(current_sources.values()):
+        if hasattr(src, "master"):
+            src.master = 1.0
+    channel = get_notification_channel(guild_id)
+    if channel is not None:
+        try:
+            await reply_note(channel, vapor.note("sleep timer", "goodnight", f"playback stopped ({why})"))
+        except Exception as e:
+            print(f"⚠️ sleep note failed: {e}")
+    await update_presence()
+
+
+async def _sleep_timer(guild_id, seconds):
+    try:
+        fade = min(SLEEP_FADE_SECONDS, seconds)
+        await asyncio.sleep(max(0.0, seconds - fade))
+        steps = max(1, int(fade / 0.5))
+        for i in range(steps):
+            src = current_sources.get(guild_id)
+            if src is not None and hasattr(src, "master"):
+                src.master = max(0.0, 1.0 - (i + 1) / steps)
+            await asyncio.sleep(0.5)
+        await _sleep_finish(guild_id, "sleep timer")
+    except asyncio.CancelledError:
+        src = current_sources.get(guild_id)
+        if src is not None and hasattr(src, "master"):
+            src.master = 1.0
+        raise
+
+
+@bot.command(name="sleep", help="Sleep timer: !sleep 30m | 1h30m | end (after this song) | off")
+@require_authorization()
+async def sleep_cmd(ctx, *, spec: str = None):
+    gid = ctx.guild.id
+    set_notification_channel(gid, ctx.channel)
+    if spec is None:
+        st = _sleep_state.get(gid)
+        if not st:
+            await reply_note(ctx, vapor.note("sleep timer", "no timer set", "try `!sleep 30m` or `!sleep end`"))
+        elif st["mode"] == "end":
+            await reply_note(ctx, vapor.note("sleep timer", "stopping after this song"))
+        else:
+            await reply_note(ctx, vapor.note("sleep timer", f"stopping in {extras.fmt_span(st['ends'] - time.time())}"))
+        return
+    try:
+        value = extras.parse_sleep(spec)
+    except ValueError as e:
+        await ctx.send(f"❌ {e}")
+        return
+    _sleep_cancel(gid)
+    if value is None:
+        await reply_note(ctx, vapor.note("sleep timer", "timer cancelled"))
+    elif value == "end":
+        _sleep_state[gid] = {"mode": "end", "ends": 0, "task": None}
+        await reply_note(ctx, vapor.note("sleep timer", "stopping after this song", "the queue is cleared when it ends"))
+    else:
+        _sleep_state[gid] = {"mode": "timer", "ends": time.time() + value,
+                             "task": _spawn(_sleep_timer(gid, float(value)))}
+        await reply_note(ctx, vapor.note("sleep timer", f"stopping in {extras.fmt_span(value)}",
+                                         f"volume fades over the last {min(SLEEP_FADE_SECONDS, value)}s"))
+
+
+# ---------------------------------------------------------------------------
+# Vote skip
+# ---------------------------------------------------------------------------
+
+def cast_vote(guild_id, member):
+    """Count one skip vote. Returns (ok, text, passed)."""
+    vc = _voice_client_for(guild_id)
+    src = current_sources.get(guild_id)
+    if not vc or src is None or not (vc.is_playing() or vc.is_paused()):
+        return False, "Nothing playing", False
+    voice = getattr(member, "voice", None)
+    if not voice or voice.channel != vc.channel:
+        return False, "Join my voice channel to vote", False
+    listeners = {m.id for m in vc.channel.members if not m.bot}
+    need = extras.votes_needed(len(listeners))
+    state = _skip_votes.get(guild_id)
+    if not state or state[0] != id(src):
+        state = (id(src), set())
+        _skip_votes[guild_id] = state
+    state[1].add(member.id)
+    state[1].intersection_update(listeners)   # people who left no longer count
+    have = len(state[1])
+    if have >= need:
+        _skip_votes.pop(guild_id, None)
+        skip_current(guild_id)
+        return True, f"vote passed ({have}/{need}) · skipped", True
+    return True, f"{have}/{need} votes to skip", False
+
+
+@bot.command(name="voteskip", aliases=["vs"], help="Vote to skip the current song (majority of listeners)")
+async def voteskip_cmd(ctx):
+    set_notification_channel(ctx.guild.id, ctx.channel)
+    ok, text, passed = cast_vote(ctx.guild.id, ctx.author)
+    if not ok:
+        await ctx.send(f"❌ {text}")
+        return
+    await reply_note(ctx, vapor.note("skipped" if passed else "voted", _safe_name(ctx.author.display_name), text))
+
+
+# ---------------------------------------------------------------------------
+# Interactive queue
+# ---------------------------------------------------------------------------
+
+class QueueView(discord.ui.View):
+    """
+    !queue as a live panel: ◀ ▶ page, 🔀 shuffle, 🧹 clear · ⏫ move to top, ⏭ play now, 🗑 remove, 🔄 refresh,
+    and a dropdown to choose the track those act on. Browsing is open to everyone; changing needs authorization.
+    """
+    _guard = NowPlayingView._guard
+
+    def __init__(self, guild_id, page=0):
+        super().__init__(timeout=600)
+        self.guild_id = guild_id
+        self.page = page
+        self.selected = None      # absolute (0-based) index in the queue
+        self.message = None
+        self.header = BadgeHeader()
+        self._sel = None
+        self._build()
+
+    def _queue(self):
+        return song_queues.get(self.guild_id) or []
+
+    def _pages(self):
+        return max(1, math.ceil(len(self._queue()) / QUEUE_PAGE))
+
+    def _build(self):
+        self.clear_items()
+        q = self._queue()
+        self.page = max(0, min(self.page, self._pages() - 1))
+        if self.selected is not None and self.selected >= len(q):
+            self.selected = None
+        sec, pri, dan = discord.ButtonStyle.secondary, discord.ButtonStyle.primary, discord.ButtonStyle.danger
+
+        def add(emoji, cb, row, style=sec, disabled=False):
+            b = discord.ui.Button(emoji=emoji, style=style, row=row, disabled=disabled)
+            b.callback = cb
+            self.add_item(b)
+
+        has = self.selected is not None
+        add("◀️", self._prev, 0, disabled=self.page <= 0)
+        add("▶️", self._next, 0, disabled=self.page >= self._pages() - 1)
+        add("🔀", self._shuffle, 0, disabled=len(q) < 2)
+        add("🧹", self._clear, 0, dan, disabled=not q)
+        add("⏫", self._to_top, 1, disabled=not has or self.selected == 0)
+        add("⏭️", self._play_now, 1, pri, disabled=not has)
+        add("🗑️", self._remove, 1, disabled=not has)
+        add("🔄", self._refresh, 1)
+        self._sel = None
+        if q:
+            start = self.page * QUEUE_PAGE
+            options = [discord.SelectOption(label=f"{i + 1}. {s['title']}"[:100], value=str(i),
+                                            default=(i == self.selected))
+                       for i, s in enumerate(q[start:start + QUEUE_PAGE], start)]
+            self._sel = discord.ui.Select(placeholder="pick a track to move, play or remove…", options=options, row=2)
+            self._sel.callback = self._pick
+            self.add_item(self._sel)
+
+    def render(self):
+        q = self._queue()
+        start = self.page * QUEUE_PAGE
+        rows = [(start + i + 1, s["title"], s.get("duration") or 0) for i, s in enumerate(q[start:start + QUEUE_PAGE])]
+        now = getattr(current_sources.get(self.guild_id), "title", None)
+        pl = PlaylistManager.get_playlist_status(self.guild_id)
+        playlist = pl.get("playlist_name") if pl.get("status") == "active" else None
+        total = sum(int(s.get("duration") or 0) for s in q)
+        return vapor.queue_card(now, rows, self.page, self._pages(), len(q), total,
+                                selected=None if self.selected is None else self.selected + 1, playlist=playlist)
+
+    async def _redraw(self, interaction):
+        self._build()
+        body = await self.header.sync(interaction.channel, self.render())
+        empty = not self._queue()
+        await interaction.response.edit_message(content=body, view=None if empty else self)
+        if empty:
+            self.stop()
+
+    async def _pick(self, interaction):
+        if not await self._guard(interaction, need_auth=False):
+            return
+        self.selected = int(self._sel.values[0])
+        await self._redraw(interaction)
+
+    async def _prev(self, interaction):
+        if not await self._guard(interaction, need_auth=False):
+            return
+        self.page, self.selected = self.page - 1, None
+        await self._redraw(interaction)
+
+    async def _next(self, interaction):
+        if not await self._guard(interaction, need_auth=False):
+            return
+        self.page, self.selected = self.page + 1, None
+        await self._redraw(interaction)
+
+    async def _refresh(self, interaction):
+        if not await self._guard(interaction, need_auth=False):
+            return
+        await self._redraw(interaction)
+
+    async def _to_top(self, interaction):
+        if not await self._guard(interaction):
+            return
+        q, i = self._queue(), self.selected
+        if i is not None and 0 <= i < len(q):
+            q.insert(0, q.pop(i))
+            self.selected, self.page = 0, 0
+        await self._redraw(interaction)
+
+    async def _play_now(self, interaction):
+        if not await self._guard(interaction):
+            return
+        q, i = self._queue(), self.selected
+        if i is None or not (0 <= i < len(q)):
+            await self._redraw(interaction)
+            return
+        q.insert(0, q.pop(i))
+        self.selected, self.page = None, 0
+        set_notification_channel(self.guild_id, interaction.channel)
+        vc = _voice_client_for(self.guild_id)
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()      # after_playing plays the head of the queue (it comes before any playlist)
+        elif vc and vc.is_connected():
+            _spawn(play_next_queued_song(self.guild_id))
+        await asyncio.sleep(0.7)
+        await self._redraw(interaction)
+
+    async def _remove(self, interaction):
+        if not await self._guard(interaction):
+            return
+        q, i = self._queue(), self.selected
+        if i is not None and 0 <= i < len(q):
+            item = q.pop(i)
+            path = item.get("file_path")
+            if path and not str(path).startswith("playlists"):
+                queue_cleanup_request(path, keep_recent=False)
+        self.selected = None
+        await self._redraw(interaction)
+
+    async def _shuffle(self, interaction):
+        if not await self._guard(interaction):
+            return
+        random.shuffle(self._queue())
+        self.selected, self.page = None, 0
+        await self._redraw(interaction)
+
+    async def _clear(self, interaction):
+        if not await self._guard(interaction):
+            return
+        clear_song_queue(self.guild_id)
+        self.selected = None
+        await self._redraw(interaction)
+
+    async def on_timeout(self):
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+
+@bot.command(name="queue", aliases=["q"], help="Show the queue (interactive: move, play now, remove)")
+async def show_queue(ctx):
+    view = QueueView(ctx.guild.id)
+    body = await view.header.sync(ctx, view.render())
+    view.message = await ctx.send(content=body, view=view if view._queue() else None)
+    if not view._queue():
+        view.stop()
+
+
+# ---------------------------------------------------------------------------
+# Favourites, history and "pick one to queue" menus
+# ---------------------------------------------------------------------------
+
+class PickView(discord.ui.View):
+    """A dropdown of remembered tracks (favourites / history); picking one queues it like `!play`."""
+
+    def __init__(self, guild_id, items, owner_id=None):
+        super().__init__(timeout=300)
+        self.guild_id, self.items, self.owner_id = guild_id, list(items), owner_id
+        self.message = None
+        self._sel = None
+        options = [discord.SelectOption(label=f"{i}. {it['title']}"[:100], value=str(i - 1))
+                   for i, it in enumerate(self.items[:25], 1)]
+        if options:
+            self._sel = discord.ui.Select(placeholder="pick one to queue…", options=options)
+            self._sel.callback = self._pick
+            self.add_item(self._sel)
+
+    async def _pick(self, interaction):
+        if interaction.guild_id != self.guild_id:
+            await interaction.response.send_message("❌ This menu belongs to another server.", ephemeral=True)
+            return
+        if self.owner_id and interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ That's someone else's list. Use `!likes` for yours.",
+                                                    ephemeral=True, delete_after=6)
+            return
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("❌ **Access denied.** Queueing needs authorization.",
+                                                    ephemeral=True, delete_after=6)
+            return
+        item = self.items[int(self._sel.values[0])]
+        await interaction.response.defer()
+        set_notification_channel(self.guild_id, interaction.channel)
+        await queue_track(PseudoCtx(interaction.guild, interaction.channel, interaction.user), item)
+
+    async def on_timeout(self):
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+
+async def _send_list(ctx, label, title, items, owner_id=None):
+    text = vapor.list_card(label, title, [(i, it["title"]) for i, it in enumerate(items[:25], 1)])
+    header = BadgeHeader()
+    body = await header.sync(ctx, text)
+    view = PickView(ctx.guild.id, items, owner_id)
+    msg = await ctx.send(content=body, view=view if items else None)
+    view.message = msg
+    return msg
+
+
+@bot.command(name="like", aliases=["fav"], help="Add the song that's playing to your favourites")
+async def like_cmd(ctx):
+    src = current_sources.get(ctx.guild.id)
+    title = getattr(src, "title", None)
+    if not title or getattr(src, "game", False):
+        await ctx.send("❌ Nothing playing to like.")
+        return
+    added = extras.add_like(DATA, ctx.author.id, title, getattr(src, "video_id", None))
+    await reply_note(ctx, vapor.note("liked", title, "added to your favourites" if added else "already in your favourites"))
+
+
+@bot.command(name="unlike", help="Remove a favourite by its number (see !likes)")
+async def unlike_cmd(ctx, number: int):
+    item = extras.remove_like(DATA, ctx.author.id, number)
+    if item is None:
+        await ctx.send("❌ No favourite with that number. See `!likes`.")
+        return
+    await reply_note(ctx, vapor.note("liked", item["title"], "removed from your favourites"))
+
+
+@bot.command(name="likes", aliases=["favs", "favorites"], help="Your favourites: !likes | !likes play [shuffle] | !likes remove N")
+async def likes_cmd(ctx, action: str = None, *, rest: str = None):
+    likes = extras.get_likes(DATA, ctx.author.id)
+    act = (action or "").lower()
+    if act in ("remove", "rm", "delete"):
+        try:
+            item = extras.remove_like(DATA, ctx.author.id, int((rest or "").strip()))
+        except ValueError:
+            item = None
+        await ctx.send("❌ Usage: `!likes remove <number>`" if item is None else f"🗑️ Removed **{item['title']}**")
+        return
+    if act == "play":
+        if not is_authorized(ctx.author.id):
+            await ctx.send("❌ **Access denied.** Playing your favourites needs authorization.")
+            return
+        if not likes:
+            await ctx.send("❌ You have no favourites yet. Use `!like` while a song plays.")
+            return
+        await play_favourites(ctx, likes, shuffle="shuffle" in (rest or "").lower())
+        return
+    await _send_list(ctx, "liked", f"{_safe_name(ctx.author.display_name)}'s favourites",
+                     list(reversed(likes))[:25], owner_id=ctx.author.id)
+
+
+@bot.command(name="history", help="Recently played songs (pick one to queue again)")
+async def history_cmd(ctx):
+    plays = extras.recent_plays(DATA, ctx.guild.id, 15)
+    await _send_list(ctx, "history", "recently played", [{"title": p["title"], "vid": p.get("vid")} for p in plays])
+
+
+# ---------------------------------------------------------------------------
+# Stats and the weekly recap
+# ---------------------------------------------------------------------------
+
+_PERIODS = {"day": (86400, "last 24 hours"), "week": (7 * 86400, "last 7 days"),
+            "month": (30 * 86400, "last 30 days"), "all": (0, "all time")}
+
+
+@bot.command(name="stats", help="Listening stats: !stats [day|week|month|all] | !stats recap on|off")
+async def stats_cmd(ctx, period: str = "week", setting: str = None):
+    gid = ctx.guild.id
+    period = (period or "week").lower()
+    if period == "recap":
+        if not is_authorized(ctx.author.id):
+            await ctx.send("❌ **Access denied.** Changing the recap needs authorization.")
+            return
+        on = (setting or "").lower() not in ("off", "0", "no", "false")
+        set_guild_setting(gid, "recap", on)
+        set_notification_channel(gid, ctx.channel)
+        await reply_note(ctx, vapor.note("stats", "weekly recap " + ("on" if on else "off"),
+                                         "posted here once a week" if on else ""))
+        return
+    if period not in _PERIODS:
+        await ctx.send("❌ Use `!stats day`, `week`, `month` or `all`.")
+        return
+    span, label = _PERIODS[period]
+    s = extras.summarize(DATA, gid, since_ts=(time.time() - span) if span else 0)
+    await reply_note(ctx, vapor.stats_card(label, s["tracks"], s["seconds"], s["top_songs"], s["top_people"]),
+                     lifetime=NOTE_SECONDS * 5)
+
+
+async def _recap_tick():
+    now = time.time()
+    for guild in list(bot.guilds):
+        if not guild_setting(guild.id, "recap", True):
+            continue
+        last = extras.last_recap(DATA, guild.id)
+        if not last:
+            extras.mark_recap(DATA, guild.id, now)     # start the clock; nothing to report yet
+            continue
+        if now - last < RECAP_EVERY:
+            continue
+        s = extras.summarize(DATA, guild.id, since_ts=last)
+        extras.mark_recap(DATA, guild.id, now)
+        if s["tracks"] < 3:
+            continue
+        channel = get_notification_channel(guild.id)
+        if channel is None and guild_setting(guild.id, "notify_channel"):
+            channel = guild.get_channel(int(guild_setting(guild.id, "notify_channel")))
+        if channel is None:
+            continue
+        try:
+            await reply_note(channel, vapor.stats_card("this week", s["tracks"], s["seconds"],
+                                                       s["top_songs"], s["top_people"]), lifetime=0)
+        except Exception as e:
+            print(f"⚠️ weekly recap failed for {guild.name}: {e}")
+
+
+async def _recap_loop():
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await _recap_tick()
+        except Exception as e:
+            print(f"⚠️ recap loop error: {e}")
+        await asyncio.sleep(3600)
+
+
+_background_started = False
+
+
+async def _start_background_tasks():
+    global _background_started
+    if _background_started:
+        return
+    _background_started = True
+    if RECAP_ENABLED:
+        _spawn(_recap_loop())
+    _spawn(_session_loop())
+
+
+bot.add_listener(_start_background_tasks, "on_ready")
+
+
+# ---------------------------------------------------------------------------
+# Lyrics
+# ---------------------------------------------------------------------------
+
+def lyrics_enabled(guild_id):
+    return LYRICS_ENABLED and bool(guild_setting(guild_id, "lyrics", False))
+
+
+async def fetch_lyrics(title, duration=0):
+    """{'lines': [(t, text)], 'plain': str, ...} from the processor (cached), or None."""
+    key = extras.lyric_query(title).lower()
+    if key in _lyrics_cache:
+        _lyrics_cache.move_to_end(key)
+        return _lyrics_cache[key] or None
+    try:
+        res = await wait_for_request(queue_info_request("lyrics", title=title, duration=duration or 0))
+    except Exception as e:
+        print(f"⚠️ lyrics request failed: {e}")
+        return None
+    if res.get("status") != "success":
+        if "no lyrics" in str(res.get("message", "")):
+            _lyrics_cache[key] = {}      # remember the miss
+        return None
+    synced = res.get("synced") or ""
+    entry = {"lines": extras.parse_lrc(synced) if synced else [],
+             "plain": res.get("plain") or re.sub(r"\[[^\]]*\]\s*", "", synced),
+             "track": res.get("track"), "artist": res.get("artist")}
+    _lyrics_cache[key] = entry
+    while len(_lyrics_cache) > 40:
+        _lyrics_cache.popitem(last=False)
+    return entry
+
+
+@bot.command(name="lyrics", help="Live lyrics under the bar: !lyrics on | off | full")
+async def lyrics_cmd(ctx, mode: str = None):
+    gid = ctx.guild.id
+    mode = (mode or "").lower()
+    if mode == "full":
+        src = current_sources.get(gid)
+        title = getattr(src, "title", None)
+        if not title:
+            await ctx.send("❌ Nothing playing.")
+            return
+        entry = await fetch_lyrics(title, getattr(src, "duration", 0))
+        if not entry or not entry.get("plain"):
+            await ctx.send("❌ No lyrics found for this track.")
+            return
+        await reply_note(ctx, vapor.note("lyrics", title, "full text below"), lifetime=0)
+        text = entry["plain"].strip()
+        for i in range(0, min(len(text), 5700), 1900):
+            await ctx.send(text[i:i + 1900])
+        return
+    if not is_authorized(ctx.author.id):
+        await ctx.send("❌ **Access denied.** Turning live lyrics on or off needs authorization (`!lyrics full` is open).")
+        return
+    if not LYRICS_ENABLED:
+        await ctx.send("❌ Lyrics are disabled (GONDOR_LYRICS=0).")
+        return
+    on = (not lyrics_enabled(gid)) if mode in ("", "toggle") else mode in ("on", "1", "yes", "true")
+    set_guild_setting(gid, "lyrics", on)
+    tracker = _np_trackers.get(gid)
+    if tracker is not None:
+        tracker.force = True
+    await reply_note(ctx, vapor.note("lyrics", "live lyrics " + ("on" if on else "off"),
+                                     "the current line shows under the bar" if on else ""))
+
+
+# ---------------------------------------------------------------------------
+# Autoplay radio
+# ---------------------------------------------------------------------------
+
+def autoplay_enabled(guild_id):
+    return bool(guild_setting(guild_id, "autoplay", False))
+
+
+async def autoplay_next(guild_id, last):
+    """The queue ran dry: ask the processor for tracks like the last one and play the first fresh one."""
+    if guild_id in _autoplay_busy:
+        return
+    _autoplay_busy.add(guild_id)
+    try:
+        guild = bot.get_guild(guild_id)
+        vc = guild.voice_client if guild else None
+        channel = get_notification_channel(guild_id)
+        if not vc or not vc.is_connected() or channel is None:
+            return
+        if vc.is_playing() or vc.is_paused() or song_queues.get(guild_id) or guild_id in _games:
+            return
+        if not [m for m in vc.channel.members if not m.bot]:
+            return      # nobody is listening: don't play to an empty room
+        n = _autoplay_count.get(guild_id, 0)
+        if n >= AUTOPLAY_MAX:
+            await reply_note(channel, vapor.note("autoplay", f"paused after {n} songs in a row",
+                                                 "ask for something with `!play` to keep going"))
+            return
+        res = await wait_for_request(queue_info_request(
+            "related", video_id=getattr(last, "video_id", None), title=getattr(last, "title", ""), max_items=15))
+        if res.get("status") != "success":
+            await reply_note(channel, vapor.note("autoplay", "couldn't find a follow-up song", str(res.get("message", ""))))
+            return
+        recent = extras.recent_video_ids(DATA, guild_id, 40)
+        pick = extras.pick_related(res.get("entries"), recent, getattr(last, "video_id", None))
+        if pick is None:
+            await reply_note(channel, vapor.note("autoplay", "nothing new to suggest"))
+            return
+        if vc.is_playing() or vc.is_paused() or song_queues.get(guild_id):
+            return      # somebody started something while we were looking
+        _autoplay_count[guild_id] = n + 1
+        author = SimpleNamespace(id=getattr(bot.user, "id", 0), name="autoplay", display_name="autoplay", mention="autoplay", voice=None)
+        await _play_impl()(PseudoCtx(guild, channel, author, autoplay=True), query=pick["url"])
+    except Exception as e:
+        print(f"⚠️ autoplay failed: {e}")
+    finally:
+        _autoplay_busy.discard(guild_id)
+
+
+@bot.command(name="autoplay", aliases=["radio"], help="Keep similar songs coming when the queue runs out: on | off")
+@require_authorization()
+async def autoplay_cmd(ctx, mode: str = None):
+    gid = ctx.guild.id
+    mode = (mode or "").lower()
+    if mode == "":
+        await reply_note(ctx, vapor.note("autoplay", "autoplay is " + ("on" if autoplay_enabled(gid) else "off"),
+                                         "`!autoplay on` / `!autoplay off`"))
+        return
+    on = mode in ("on", "1", "yes", "true")
+    set_guild_setting(gid, "autoplay", on)
+    set_notification_channel(gid, ctx.channel)
+    _autoplay_count.pop(gid, None)
+    await reply_note(ctx, vapor.note("autoplay", "autoplay " + ("on" if on else "off"),
+                                     "when the queue runs out I'll queue similar songs" if on else ""))
+
+
+# ---------------------------------------------------------------------------
+# Guess the song
+# ---------------------------------------------------------------------------
+
+class GuessGame:
+    def __init__(self, guild, channel, tracks):
+        self.guild, self.channel = guild, channel
+        self.tracks = tracks
+        self.rounds = len(tracks)
+        self.scores = {}          # user id -> [name, points]
+        self.titles = None        # acceptable answers for the round being played (None between rounds)
+        self.winner = None
+        self.answered = asyncio.Event()
+        self.skip = asyncio.Event()
+        self.stopping = False
+        self.task = None
+        self.prefetch = {}        # round index -> processor request id
+
+
+def _scoreboard(game):
+    ranking = sorted(game.scores.values(), key=lambda v: -v[1])
+    return [f"{i}. {name} · {pts}" for i, (name, pts) in enumerate(ranking[:6], 1)] or ["nobody scored"]
+
+
+async def _wait_first(a, b, timeout):
+    tasks = [asyncio.ensure_future(a.wait()), asyncio.ensure_future(b.wait())]
+    try:
+        await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            t.cancel()
+
+
+async def _guess_listener(message):
+    if message.author.bot or not message.guild or not message.content:
+        return
+    game = _games.get(message.guild.id)
+    if game is None or game.titles is None or message.channel.id != game.channel.id:
+        return
+    if message.content.startswith("!") or game.winner is not None:
+        return
+    if any(extras.guess_matches(message.content, t) for t in game.titles):
+        game.winner = message.author
+        game.answered.set()
+
+
+bot.add_listener(_guess_listener, "on_message")
+
+
+async def _run_game(game):
+    gid = game.guild.id
+
+    def prefetch(i):
+        if i < game.rounds and i not in game.prefetch:
+            game.prefetch[i] = queue_audio_request(game.tracks[i]["url"])
+
+    try:
+        prefetch(0)
+        await reply_note(game.channel, vapor.note(
+            "guess", f"{game.rounds} rounds · {GUESS_CLIP_SECONDS}s clips",
+            "type the song or artist in chat", "first correct answer takes the point"), lifetime=15)
+        await asyncio.sleep(2)
+        for i in range(game.rounds):
+            if game.stopping:
+                break
+            prefetch(i + 1)
+            track = game.tracks[i]
+            res = await wait_for_request(game.prefetch.pop(i))
+            if game.stopping:
+                break
+            path = res.get("file_path")
+            if res.get("status") != "success" or not path or not os.path.exists(path):
+                await game.channel.send(f"⚠️ Round {i + 1} couldn't load, skipping it.")
+                continue
+            vc = game.guild.voice_client
+            if not vc or not vc.is_connected():
+                break
+            title = res.get("title") or track["title"]
+            duration = int(res.get("duration") or 0)
+            start = random.uniform(0.15, 0.55) * duration if duration >= 75 else 0.0
+            game.winner = None
+            game.answered.clear()
+            game.skip.clear()
+            src = make_audio_source(gid, path, title=title, duration=duration, start_offset=start,
+                                    clip_seconds=GUESS_CLIP_SECONDS, game=True)
+            apply_saved_volume(gid, src)
+            current_sources[gid] = src
+            game.titles = [title, track["title"]]
+            vc.play(src, after=lambda e: after_playing(e, gid))
+            await reply_note(game.channel, vapor.note("guess", f"round {i + 1}/{game.rounds}",
+                                                      "listen…  what song is this?"), lifetime=GUESS_ROUND_SECONDS)
+            await _wait_first(game.answered, game.skip, GUESS_ROUND_SECONDS)
+            game.titles = None
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+            if game.stopping:
+                break
+            if game.winner is not None:
+                entry = game.scores.setdefault(game.winner.id, [_safe_name(game.winner.display_name), 0])
+                entry[1] += 1
+                await reply_note(game.channel, vapor.note("winner", f"{entry[0]} got it! (+1)", title,
+                                                          f"{entry[0]}: {entry[1]} point" + ("" if entry[1] == 1 else "s")),
+                                 lifetime=20)
+            else:
+                await reply_note(game.channel, vapor.note("guess", "nobody got it", f"it was: {title}"), lifetime=20)
+            await asyncio.sleep(4)
+        await reply_note(game.channel, vapor.note("winner", "game over", *_scoreboard(game)), lifetime=60)
+    except Exception as e:
+        print(f"⚠️ guess game error: {e}")
+        try:
+            await game.channel.send(f"❌ The guessing game hit an error: {e}")
+        except Exception:
+            pass
+    finally:
+        game.titles = None
+        _games.pop(gid, None)
+        vc = game.guild.voice_client
+        src = current_sources.get(gid)
+        if vc and src is not None and getattr(src, "game", False) and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+
+
+def guess_pool(guild_id):
+    """Songs this server has played plus everyone's favourites."""
+    seen, pool = set(), []
+
+    def add(title, vid):
+        key = vid or title
+        if not title or key in seen:
+            return
+        seen.add(key)
+        pool.append({"title": title, "vid": vid, "url": _youtube_ref({"title": title, "vid": vid})})
+
+    with DATA.lock:
+        for p in DATA.guild(guild_id).get("plays", []):
+            add(p.get("title"), p.get("vid"))
+        for user in DATA.data.get("users", {}).values():
+            for like in user.get("likes", []):
+                add(like.get("title"), like.get("vid"))
+    return pool
+
+
+@bot.command(name="guess", help="Guess-the-song game: !guess [rounds] [playlist url] | stop | skip")
+@require_authorization()
+async def guess_cmd(ctx, *args):
+    gid = ctx.guild.id
+    game = _games.get(gid)
+    word = args[0].lower() if args else ""
+    if word in ("stop", "end", "quit", "skip"):
+        if game is None:
+            await ctx.send("❌ No guessing game is running.")
+            return
+        if word == "skip":
+            game.skip.set()
+            return
+        game.stopping = True
+        game.skip.set()
+        game.answered.set()
+        await reply_note(ctx, vapor.note("guess", "game stopped"))
+        return
+    if game is not None:
+        await ctx.send("❌ A guessing game is already running. `!guess stop` ends it.")
+        return
+    vc = ctx.guild.voice_client
+    if not vc or not _voice_session_usable(vc):
+        await ctx.send("❌ I'm not connected to a voice channel! Use `!summon` first.")
+        return
+    if vc.is_playing() or vc.is_paused() or song_queues.get(gid) or PlaylistManager.get_playlist_status(gid)["status"] == "active":
+        await ctx.send("❌ Stop the music first (`!stop`), then start the game.")
+        return
+    rounds, url = 5, None
+    for a in args:
+        if a.isdigit():
+            rounds = max(1, min(15, int(a)))
+        elif a.lower().startswith(("http://", "https://")):
+            url = a
+    set_notification_channel(gid, ctx.channel)
+    if url:
+        info = await wait_for_request(queue_playlist_info_request(url, 60))
+        if info.get("status") != "success":
+            await ctx.send(f"❌ {info.get('message', 'Could not read that playlist')}")
+            return
+        pool = [{"title": e["title"], "vid": e["id"], "url": e["url"]} for e in info.get("entries", [])]
+    else:
+        pool = guess_pool(gid)
+    if len(pool) < 3:
+        await ctx.send("❌ I don't know enough songs yet. Play a few, `!like` some, or use `!guess <playlist url>`.")
+        return
+    random.shuffle(pool)
+    game = GuessGame(ctx.guild, ctx.channel, pool[:rounds])
+    _games[gid] = game
+    game.task = _spawn(_run_game(game))
+
+
+# ============================================================================
+# 🏠 DASHBOARD + SESSION MEMORY
+#    While music plays the bot keeps a small snapshot of the session (what's playing and where, the queue,
+#    the rest of a YouTube playlist) as song REFERENCES, not files: tracks are deleted after play, so resuming
+#    simply fetches them again. The dashboard posted after !summon (and by !dashboard) can resume that session,
+#    play favourites, replay recent songs, quick-play from a pop-up, start a radio, change effects/toggles
+#    and show this week's stats.
+# ============================================================================
+
+DASHBOARD_ON_SUMMON = _env_flag("GONDOR_DASHBOARD")      # post the dashboard automatically after !summon
+SESSION_MAX_AGE = 14 * 86400                              # a saved session older than this is ignored
+SESSION_SAVE_EVERY = 30                                   # seconds between disk writes while nothing changes
+FAV_PLAYLIST_URL = "https://www.youtube.com/playlist?list=gondor-favourites"      # placeholders: the entries are
+SESSION_PLAYLIST_URL = "https://www.youtube.com/playlist?list=gondor-last-session"  # supplied, nothing is fetched
+
+_session_saved_at = {}
+_session_dirty = set()
+_dashboards = {}          # guild_id -> latest DashboardView
+
+
+def _session_entry(title, vid, duration):
+    return {"title": str(title or "Unknown")[:200], "vid": vid, "duration": int(duration or 0)}
+
+
+def build_session_snapshot(guild_id):
+    """What is playing right now plus everything waiting behind it, or None if nothing worth saving."""
+    vc = _voice_client_for(guild_id)
+    src = current_sources.get(guild_id)
+    if not vc or src is None or getattr(src, "game", False):
+        return None
+    if not (vc.is_playing() or vc.is_paused()) or not getattr(src, "title", None):
+        return None
+    now = _session_entry(src.title, getattr(src, "video_id", None), getattr(src, "duration", 0))
+    now["pos"] = round(float(getattr(src, "elapsed", 0.0)), 1)
+    queue = [_session_entry(s.get("title"), s.get("video_id"), s.get("duration"))
+             for s in (song_queues.get(guild_id) or [])[:60]]
+    playlist = None
+    pl = playlist_queues.get(guild_id)
+    if pl and pl.get("stream"):       # YouTube imports only: saved on-disk playlists are files already
+        songs = pl.get("songs") or []
+        idx = int(pl.get("current_index") or 0)
+        playlist = {"name": pl.get("playlist_name") or "playlist",
+                    "songs": [_session_entry(s.get("title"), s.get("video_id"), s.get("duration"))
+                              for s in songs[idx:idx + 150]]}
+    return {"t": int(time.time()), "now": now, "queue": queue, "playlist": playlist}
+
+
+def snapshot_session(guild_id, save=True):
+    """Remember the session. Writes to disk when something changed (or every SESSION_SAVE_EVERY seconds)."""
+    snap = build_session_snapshot(guild_id)
+    if snap is None:
+        return False
+    with DATA.lock:
+        guild = DATA.guild(guild_id)
+        old = guild.get("session")
+        changed = (not old or old["now"].get("title") != snap["now"]["title"]
+                   or len(old.get("queue") or []) != len(snap["queue"]))
+        guild["session"] = snap
+        due = changed or time.time() - _session_saved_at.get(guild_id, 0) > SESSION_SAVE_EVERY
+        if due:
+            _session_saved_at[guild_id] = time.time()
+            if save:
+                DATA.save()
+            else:
+                _session_dirty.add(guild_id)
+    return True
+
+
+def session_clear(guild_id):
+    """Everything finished on its own: nothing left to resume."""
+    with DATA.lock:
+        if DATA.guild(guild_id).pop("session", None) is not None:
+            DATA.save()
+
+
+def get_session(guild_id):
+    s = DATA.guild(guild_id).get("session")
+    if not s or not s.get("now") or time.time() - s.get("t", 0) > SESSION_MAX_AGE:
+        return None
+    return s
+
+
+def session_entries(session):
+    """The saved session as playlist-import entries: current song first, then the queue, then the playlist rest."""
+    items = [session["now"]] + list(session.get("queue") or []) + list((session.get("playlist") or {}).get("songs") or [])
+    entries, seen = [], set()
+    for i, it in enumerate(items):
+        key = it.get("vid") or it.get("title")
+        if not it.get("title") or key in seen:
+            continue
+        seen.add(key)
+        entries.append({"id": it.get("vid") or f"res{i}", "title": it["title"], "duration": int(it.get("duration") or 0),
+                        "url": _youtube_ref(it)})
+    return entries
+
+
+async def _apply_resume_seek(guild_id, title, vid, pos, tries=120):
+    """After a resume starts the interrupted song, jump back to where it was."""
+    for _ in range(tries):
+        await asyncio.sleep(1)
+        src = current_sources.get(guild_id)
+        if src is not None and not getattr(src, "game", False) and getattr(src, "elapsed", 99) < 6 and \
+                (getattr(src, "title", None) == title or (vid and getattr(src, "video_id", None) == vid)):
+            seek_current(guild_id, to=pos)
+            return True
+    return False
+
+
+async def resume_session(pctx):
+    """Re-queue the last session. Returns (ok, message)."""
+    gid = pctx.guild.id
+    session = get_session(gid)
+    if session is None:
+        return False, "No previous session saved yet."
+    vc = pctx.guild.voice_client
+    if not vc or not _voice_session_usable(vc):
+        return False, "I'm not connected to a voice channel. Use `!summon` first."
+    entries = session_entries(session)
+    if not entries:
+        return False, "The saved session is empty."
+    now = session["now"]
+    info = {"status": "success", "title": (session.get("playlist") or {}).get("name") or "last session",
+            "entries": entries, "total": len(entries)}
+    await _begin_playlist_import(pctx, SESSION_PLAYLIST_URL, preloaded_info=info)
+    pos, dur = float(now.get("pos") or 0), float(now.get("duration") or 0)
+    if pos >= 20 and (not dur or pos < dur - 15):
+        _spawn(_apply_resume_seek(gid, now["title"], now.get("vid"), pos))
+    return True, f"{len(entries)} song" + ("" if len(entries) == 1 else "s")
+
+
+async def play_favourites(ctx, likes, shuffle=False):
+    entries = [{"id": it.get("vid") or f"fav{i}", "title": it["title"], "duration": 0, "url": _youtube_ref(it)}
+               for i, it in enumerate(likes[-100:])]
+    info = {"status": "success", "title": f"{_safe_name(ctx.author.display_name)}'s favourites",
+            "entries": entries, "total": len(entries)}
+    await _begin_playlist_import(ctx, FAV_PLAYLIST_URL, shuffle=shuffle, preloaded_info=info)
+
+
+def apply_effect(guild_id, spec):
+    """Set the server's effect and apply it to the song playing now. Returns (description, applied_live)."""
+    key, _flt, _speed, desc = extras.resolve_effect(spec)       # ValueError for unknown effects
+    set_guild_setting(guild_id, "effect", key)
+    live = False
+    src = current_sources.get(guild_id)
+    vc = _voice_client_for(guild_id)
+    if src is not None and vc is not None and (vc.is_playing() or vc.is_paused()) and not getattr(src, "game", False):
+        live, _info = seek_current(guild_id, to=src.elapsed)    # restart ffmpeg at the same spot with the new filter
+    return desc, live
+
+
+def _radio_seed(guild_id):
+    src = current_sources.get(guild_id)
+    if src is not None and getattr(src, "title", None) and not getattr(src, "game", False):
+        return SimpleNamespace(video_id=getattr(src, "video_id", None), title=src.title)
+    plays = extras.recent_plays(DATA, guild_id, 1)
+    if plays:
+        return SimpleNamespace(video_id=plays[0].get("vid"), title=plays[0]["title"])
+    s = get_session(guild_id)
+    if s:
+        return SimpleNamespace(video_id=s["now"].get("vid"), title=s["now"]["title"])
+    return None
+
+
+class QuickPlayModal(discord.ui.Modal, title="Quick play"):
+    query = discord.ui.TextInput(label="Song name, link or playlist URL", placeholder="e.g. daft punk get lucky",
+                                 max_length=200)
+
+    def __init__(self, dash):
+        super().__init__()
+        self.dash = dash
+
+    async def on_submit(self, interaction):
+        if not is_authorized(interaction.user.id):
+            await interaction.response.send_message("❌ **Access denied.** Playing needs authorization.",
+                                                    ephemeral=True, delete_after=6)
+            return
+        text = str(self.query.value or "").strip()
+        if not text:
+            await interaction.response.send_message("❌ Type a song name or paste a link.", ephemeral=True, delete_after=6)
+            return
+        await interaction.response.defer()
+        set_notification_channel(self.dash.guild_id, interaction.channel)
+        await _play_impl()(PseudoCtx(interaction.guild, interaction.channel, interaction.user), query=text)
+        await self.dash.redraw()
+
+
+class DashboardView(discord.ui.View):
+    """
+    Home panel: resume last session · favourites (+shuffle) · radio · quick play · stats, a "recently played"
+    dropdown, an effect dropdown and autoplay / lyrics / fade toggles. Viewing is open; actions need authorization.
+    """
+    _guard = NowPlayingView._guard
+
+    def __init__(self, guild_id):
+        super().__init__(timeout=900)
+        self.guild_id = guild_id
+        self.message = None
+        self.header = BadgeHeader()
+        self._recent = []
+        self._effect_sel = self._recent_sel = None
+        self._build()
+
+    # ---- layout ---------------------------------------------------------
+    def _playing(self):
+        vc = _voice_client_for(self.guild_id)
+        return bool(vc and (vc.is_playing() or vc.is_paused()))
+
+    def _build(self):
+        self.clear_items()
+        gid = self.guild_id
+        sec, pri = discord.ButtonStyle.secondary, discord.ButtonStyle.primary
+        ok_style = discord.ButtonStyle.success
+
+        def add(label, emoji, cb, row, style=sec, disabled=False):
+            b = discord.ui.Button(label=label, emoji=emoji, style=style, row=row, disabled=disabled)
+            b.callback = cb
+            self.add_item(b)
+            return b
+
+        add("Resume", "⏮️", self._resume, 0, pri, disabled=get_session(gid) is None or self._playing())
+        add("Favourites", "❤️", self._favs, 0)
+        add("Radio", "📻", self._radio, 0)
+        add("Shuffle favs", "🔀", self._shuffle_favs, 1)
+        add("Quick play", "🔎", self._quick, 1)
+        add("Stats", "📊", self._stats, 1)
+        plays = extras.recent_plays(DATA, gid, 10)
+        self._recent = [{"title": p["title"], "vid": p.get("vid")} for p in plays]
+        self._recent_sel = None
+        if self._recent:
+            self._recent_sel = discord.ui.Select(
+                placeholder="🕘 Recently played: pick one to queue…", row=2,
+                options=[discord.SelectOption(label=f"{i}. {it['title']}"[:100], value=str(i - 1))
+                         for i, it in enumerate(self._recent, 1)])
+            self._recent_sel.callback = self._pick_recent
+            self.add_item(self._recent_sel)
+        current = (guild_setting(gid, "effect", "off") or "off").replace("speed:", "speed ")
+        names = list(extras.effect_names()) + ["speed 1.25", "speed 1.5"]
+        self._effect_sel = discord.ui.Select(
+            placeholder=f"🎛 Effect: {current}", row=3,
+            options=[discord.SelectOption(label=n, value=n, default=(n == current),
+                                          description=(extras.EFFECTS[n][2] if n in extras.EFFECTS else "playback speed")[:100])
+                     for n in names])
+        self._effect_sel.callback = self._pick_effect
+        self.add_item(self._effect_sel)
+        add("Autoplay", "🔁", self._toggle_autoplay, 4, ok_style if autoplay_enabled(gid) else sec)
+        add("Lyrics", "🎤", self._toggle_lyrics, 4, ok_style if lyrics_enabled(gid) else sec, disabled=not LYRICS_ENABLED)
+        add("Fade", "🌊", self._toggle_fade, 4, ok_style if guild_fade(gid) else sec)
+
+    def render(self):
+        gid = self.guild_id
+        lines = []
+        s = get_session(gid)
+        if s:
+            more = len(s.get("queue") or []) + len((s.get("playlist") or {}).get("songs") or [])
+            lines.append(f"last session: {s['now']['title']}" + (f" (+{more} more)" if more else ""))
+            lines.append(f"saved {extras.fmt_span(time.time() - s['t'])} ago")
+        else:
+            lines.append("last session: nothing saved yet")
+        fx = (guild_setting(gid, "effect", "off") or "off").replace("speed:", "x")
+        fade = guild_fade(gid)
+        lines.append(f"fx {fx} · fade {f'{fade:g}s' if fade else 'off'} · autoplay {'on' if autoplay_enabled(gid) else 'off'}")
+        lines.append(f"lyrics {'on' if lyrics_enabled(gid) else 'off'} · volume {int(round(get_volume(gid) * 100))}%")
+        week = extras.summarize(DATA, gid, since_ts=time.time() - 7 * 86400)
+        lines.append(f"this week: {week['tracks']} tracks" + (f" · {vapor.fmt_long_duration(week['seconds'])}" if week["seconds"] else ""))
+        return vapor.note("dashboard", *lines)
+
+    async def redraw(self):
+        if self.message is None:
+            return
+        self._build()
+        try:
+            body = await self.header.sync(self.message.channel, self.render())
+            await self.message.edit(content=body, view=self)
+        except discord.HTTPException:
+            pass
+
+    async def retire(self):
+        self.stop()
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+    async def on_timeout(self):
+        await self.retire()
+
+    # ---- helpers --------------------------------------------------------
+    def _pctx(self, interaction):
+        set_notification_channel(self.guild_id, interaction.channel)
+        return PseudoCtx(interaction.guild, interaction.channel, interaction.user)
+
+    async def _say(self, interaction, text):
+        await interaction.response.send_message(f"❌ {text}", ephemeral=True, delete_after=8)
+
+    # ---- buttons --------------------------------------------------------
+    async def _resume(self, interaction):
+        if not await self._guard(interaction):
+            return
+        if get_session(self.guild_id) is None:
+            return await self._say(interaction, "No previous session saved yet.")
+        await interaction.response.defer()
+        ok, text = await resume_session(self._pctx(interaction))
+        if not ok:
+            await interaction.channel.send(f"❌ {text}")
+        await self.redraw()
+
+    async def _play_favs(self, interaction, shuffle):
+        if not await self._guard(interaction):
+            return
+        likes = extras.get_likes(DATA, interaction.user.id)
+        if not likes:
+            return await self._say(interaction, "You have no favourites yet. Use `!like` while a song plays.")
+        await interaction.response.defer()
+        await play_favourites(self._pctx(interaction), likes, shuffle)
+        await self.redraw()
+
+    async def _favs(self, interaction):
+        await self._play_favs(interaction, False)
+
+    async def _shuffle_favs(self, interaction):
+        await self._play_favs(interaction, True)
+
+    async def _radio(self, interaction):
+        if not await self._guard(interaction):
+            return
+        seed = _radio_seed(self.guild_id)
+        if seed is None:
+            return await self._say(interaction, "Play something first so I know what to base the radio on.")
+        set_guild_setting(self.guild_id, "autoplay", True)
+        _autoplay_count.pop(self.guild_id, None)
+        await interaction.response.defer()
+        self._pctx(interaction)
+        if not self._playing():
+            await autoplay_next(self.guild_id, seed)
+        await self.redraw()
+
+    async def _quick(self, interaction):
+        if not await self._guard(interaction):
+            return
+        await interaction.response.send_modal(QuickPlayModal(self))
+
+    async def _stats(self, interaction):
+        if not await self._guard(interaction, need_auth=False):
+            return
+        s = extras.summarize(DATA, self.guild_id, since_ts=time.time() - 7 * 86400)
+        await interaction.response.defer()
+        await reply_note(interaction.channel, vapor.stats_card("last 7 days", s["tracks"], s["seconds"],
+                                                               s["top_songs"], s["top_people"]),
+                         lifetime=NOTE_SECONDS * 5)
+
+    # ---- dropdowns ------------------------------------------------------
+    async def _pick_recent(self, interaction):
+        if not await self._guard(interaction):
+            return
+        item = self._recent[int(self._recent_sel.values[0])]
+        await interaction.response.defer()
+        await queue_track(self._pctx(interaction), item)
+        await self.redraw()
+
+    async def _pick_effect(self, interaction):
+        if not await self._guard(interaction):
+            return
+        await interaction.response.defer()
+        try:
+            apply_effect(self.guild_id, self._effect_sel.values[0])
+        except ValueError as e:
+            await interaction.channel.send(f"❌ {e}")
+        await self.redraw()
+
+    # ---- toggles --------------------------------------------------------
+    async def _toggle(self, interaction, key, on_value, off_value, current_on):
+        if not await self._guard(interaction):
+            return
+        set_guild_setting(self.guild_id, key, off_value if current_on else on_value)
+        await interaction.response.defer()
+        await self.redraw()
+
+    async def _toggle_autoplay(self, interaction):
+        _autoplay_count.pop(self.guild_id, None)
+        await self._toggle(interaction, "autoplay", True, False, autoplay_enabled(self.guild_id))
+
+    async def _toggle_lyrics(self, interaction):
+        await self._toggle(interaction, "lyrics", True, False, lyrics_enabled(self.guild_id))
+        tracker = _np_trackers.get(self.guild_id)
+        if tracker is not None:
+            tracker.force = True
+
+    async def _toggle_fade(self, interaction):
+        gid = self.guild_id
+        await self._toggle(interaction, "fade", 4.0, 0.0, bool(guild_fade(gid)))
+        src = current_sources.get(gid)
+        if src is not None and hasattr(src, "fade") and not getattr(src, "game", False):
+            src.fade = guild_fade(gid)
+
+
+async def post_dashboard(dest):
+    """Send the dashboard (badge GIF above, panel below); the previous one in this server loses its buttons."""
+    gid = _dest_guild_id(dest)
+    view = DashboardView(gid)
+    old = _dashboards.get(gid)
+    if old is not None:
+        await old.retire()
+    body = await view.header.sync(dest, view.render())
+    view.message = await dest.send(content=body, view=view)
+    _dashboards[gid] = view
+    return view.message
+
+
+@bot.command(name="dashboard", aliases=["menu", "home"], help="Open the dashboard: resume, favourites, radio, quick settings")
+async def dashboard_cmd(ctx):
+    set_notification_channel(ctx.guild.id, ctx.channel)
+    await post_dashboard(ctx)
+
+
+async def _session_tick():
+    """Snapshot every server that is playing; flush to disk off the event loop."""
+    for guild in list(bot.guilds):
+        snapshot_session(guild.id, save=False)
+    if _session_dirty:
+        _session_dirty.clear()
+        await asyncio.to_thread(DATA.save)
+
+
+async def _session_loop():
+    await asyncio.sleep(10)
+    while True:
+        try:
+            await _session_tick()
+        except Exception as e:
+            print(f"⚠️ session snapshot error: {e}")
+        await asyncio.sleep(10)
+
+
 # Run the bot with fresh token
 if __name__ == "__main__":
     TOKEN = os.getenv('NEW_DISCORD_TOKEN')
@@ -3336,5 +6877,6 @@ if __name__ == "__main__":
     print("🚀 Starting Discord Audio Bot...")
     print("🎵 Initializing streaming services...")
     print("📁 Loading audio file management...")
+    _ensure_single_streaming_instance()
     _ensure_audio_processor_subprocess()
     bot.run(TOKEN)

@@ -81,3 +81,16 @@ temp_audio/
 *.mp3
 *.wav
 *.flac
+# Generated GIF cache (rebuilt automatically)
+gif_cache/
+gondor_settings.json
+gondor_data.json
+
+# Runtime state (recreated by the bot; never commit)
+media_library/
+request_queue/
+playback_state.json
+voice_state.json
+.gondor_streaming.lock
+*.part
+package-lock.json
