@@ -1,10 +1,10 @@
 """
-Vaporwave x breakcore text helpers for Gondor's Discord status messages.
+Vaporwave x breakcore text helpers for Arken's Discord status messages.
 
 Only *labels* are styled. Song titles and real error details are always passed
 through untouched so they stay readable / reportable.
 
-Set GONDOR_VAPOR=0 in .env to turn all styling off (plain text fallbacks).
+Set ARKEN_VAPOR=0 in .env to turn all styling off (plain text fallbacks).
 """
 
 import os
@@ -12,12 +12,14 @@ import random
 import textwrap
 import unicodedata
 
-ENABLED = os.environ.get("GONDOR_VAPOR", "1").strip().lower() not in ("0", "false", "no", "off")
+import arken_env as aenv
+
+ENABLED = aenv.get("VAPOR", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # Animated GIF badges replace the text header line of status messages (see gif_art.py).
-# GONDOR_GIFS=0 turns them off (the text header is used instead).
-CRASH_GIF = os.environ.get("GONDOR_CRASH_GIF", "1").strip().lower() not in ("0", "false", "no", "off")
-BADGES = ENABLED and os.environ.get("GONDOR_GIFS", "1").strip().lower() not in ("0", "false", "no", "off")
+# ARKEN_GIFS=0 turns them off (the text header is used instead).
+CRASH_GIF = aenv.get("CRASH_GIF", "1").strip().lower() not in ("0", "false", "no", "off")
+BADGES = ENABLED and aenv.get("GIFS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # Classic vaporwave pastels (embed colours)
 PALETTE = [0xFF71CE, 0x01CDFE, 0x05FFA1, 0xB967FF, 0xFFFB96]

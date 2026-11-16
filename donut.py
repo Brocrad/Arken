@@ -1,5 +1,5 @@
 """
-Spinning ASCII donut (a port of Andy Sloane's donut.c) for Gondor's summon animation.
+Spinning ASCII donut (a port of Andy Sloane's donut.c) for Arken's summon animation.
 
 Frames are rendered once, in a background thread, and cached - the math is ~25k loop
 iterations per frame, which is fine off the event loop but not something to repeat per summon.

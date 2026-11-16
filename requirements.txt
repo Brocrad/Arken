@@ -1,4 +1,4 @@
-# Voice: discord.py master + davey. Legacy IDENTIFY (max_dave=0) only if GONDOR_VOICE_NO_DAVE=1 — off by default.
+# Voice: discord.py master + davey. Legacy IDENTIFY (max_dave=0) only if ARKEN_VOICE_NO_DAVE=1 — off by default.
 discord.py[voice] @ git+https://github.com/Rapptz/discord.py.git
 requests>=2.31.0
 yt-dlp>=2025.10.14

@@ -1,0 +1,88 @@
+# Multi-token pool example. Each service is one Discord bot application.
+# Shared ./data holds allowed_guilds.json + token_pool.json for sticky assignment.
+#
+# Setup:
+#   1. Create N Discord apps/bots; put tokens in .env.t0 … .env.tN.
+#   2. In the root .env set:
+#        ARKEN_TOKEN_POOL=gondor,osgiliath,nimloth,morthond
+#        ARKEN_MAX_GUILDS_PER_TOKEN=5
+#   3. Each token env file needs NEW_DISCORD_TOKEN=... (city name = bot / token id).
+#   4. Start: docker compose -f docker-compose.yml -f docker-compose.pool.yml up -d --build
+#   5. !allowguild auto-assigns city + callsign (e.g. Gondor · Citadel).
+#
+# Scale by copying a service block and adding the city id to ARKEN_TOKEN_POOL.
+
+x-arken-pool: &arken-pool
+  build:
+    context: .
+    args:
+      UID: ${ARKEN_UID:-1000}
+      GID: ${ARKEN_GID:-1000}
+  image: arken:latest
+  restart: unless-stopped
+  volumes:
+    - ./data:/data
+    - ./data/playlists:/app/playlists
+  stop_grace_period: 20s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # Hide the single-bot service from docker-compose.yml while the pool is active.
+  arken:
+    profiles: ["single"]
+
+  arken-gondor:
+    <<: *arken-pool
+    container_name: arken-gondor
+    env_file:
+      - .env
+      - path: .env.gondor
+        required: false
+    environment:
+      ARKEN_TOKEN_ID: gondor
+      ARKEN_TOKEN_POOL: ${ARKEN_TOKEN_POOL:-gondor,osgiliath,nimloth,morthond}
+      ARKEN_MAX_GUILDS_PER_TOKEN: ${ARKEN_MAX_GUILDS_PER_TOKEN:-5}
+      ARKEN_METRICS: ${ARKEN_METRICS:-1}
+
+  arken-osgiliath:
+    <<: *arken-pool
+    container_name: arken-osgiliath
+    env_file:
+      - .env
+      - path: .env.osgiliath
+        required: false
+    environment:
+      ARKEN_TOKEN_ID: osgiliath
+      ARKEN_TOKEN_POOL: ${ARKEN_TOKEN_POOL:-gondor,osgiliath,nimloth,morthond}
+      ARKEN_MAX_GUILDS_PER_TOKEN: ${ARKEN_MAX_GUILDS_PER_TOKEN:-5}
+      ARKEN_METRICS: ${ARKEN_METRICS:-1}
+
+  arken-nimloth:
+    <<: *arken-pool
+    container_name: arken-nimloth
+    env_file:
+      - .env
+      - path: .env.nimloth
+        required: false
+    environment:
+      ARKEN_TOKEN_ID: nimloth
+      ARKEN_TOKEN_POOL: ${ARKEN_TOKEN_POOL:-gondor,osgiliath,nimloth,morthond}
+      ARKEN_MAX_GUILDS_PER_TOKEN: ${ARKEN_MAX_GUILDS_PER_TOKEN:-5}
+      ARKEN_METRICS: ${ARKEN_METRICS:-1}
+
+  arken-morthond:
+    <<: *arken-pool
+    container_name: arken-morthond
+    env_file:
+      - .env
+      - path: .env.morthond
+        required: false
+    environment:
+      ARKEN_TOKEN_ID: morthond
+      ARKEN_TOKEN_POOL: ${ARKEN_TOKEN_POOL:-gondor,osgiliath,nimloth,morthond}
+      ARKEN_MAX_GUILDS_PER_TOKEN: ${ARKEN_MAX_GUILDS_PER_TOKEN:-5}
+      ARKEN_METRICS: ${ARKEN_METRICS:-1}

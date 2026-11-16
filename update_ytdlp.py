@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Update yt-dlp (delegates to gondor_deps). For full project deps use:
-  python gondor_deps.py
-or set GONDOR_AUTO_UPDATE_DEPS=1 to upgrade from requirements.txt on bot start.
+Update yt-dlp (delegates to arken_deps). For full project deps use:
+  python arken_deps.py
+or set ARKEN_AUTO_UPDATE_DEPS=1 to upgrade from requirements.txt on bot start.
 """
 
 import subprocess
 import sys
 
-from gondor_deps import upgrade_ytdlp_only
+from arken_deps import upgrade_ytdlp_only
 
 
 def update_ytdlp():
@@ -31,10 +31,10 @@ def update_ytdlp():
 
 
 if __name__ == "__main__":
-    print("🚀 Gondor yt-dlp Update Script")
+    print("🚀 Arken yt-dlp Update Script")
     print("=" * 40)
     print("💡 For all dependencies: pip install -U -r requirements.txt")
-    print("   or: python -c \"from gondor_deps import upgrade_from_requirements; upgrade_from_requirements()\"")
+    print("   or: python -c \"from arken_deps import upgrade_from_requirements; upgrade_from_requirements()\"")
     print("=" * 40)
     if update_ytdlp():
         print("\n✅ Update completed! Restart the bot if it is running.")

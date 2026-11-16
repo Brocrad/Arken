@@ -697,7 +697,7 @@ async def kill(ctx: commands.Context):
 async def commands_list(ctx: commands.Context):
     """Show all available commands"""
     help_embed = discord.Embed(
-        title="🎵 Gondor Music Bot Commands",
+        title="🎵 Arken Music Bot Commands",
         description="⚠️ **Important:** Use `!summon` first to bring me to your voice channel!\n\nYour advanced Discord music bot with event-driven cleanup!",
         color=0x00ff00
     )
@@ -741,7 +741,7 @@ async def commands_list(ctx: commands.Context):
     except Exception as e:
         # Fallback to plain text if embeds don't work
         help_text = """
-🎵 **Gondor Music Bot Commands**
+🎵 **Arken Music Bot Commands**
 
 ⚠️ **Important:** Use `!summon` first to bring me to your voice channel!
 

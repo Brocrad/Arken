@@ -24,11 +24,12 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import gondor_extras  # pure helpers (lyric title cleanup / best-match picking)
+import arken_env as aenv
+import arken_extras as extras
 
 
-def _gondor_ffmpeg() -> str | None:
-    env = os.environ.get("GONDOR_FFMPEG", "").strip()
+def _arken_ffmpeg() -> str | None:
+    env = aenv.get("FFMPEG", "").strip()
     if env and os.path.isfile(env):
         return env
     found = shutil.which("ffmpeg")
@@ -37,7 +38,7 @@ def _gondor_ffmpeg() -> str | None:
 
 # Cover thumbnails: the bot (which is air-gapped) shows a pixel-art version of the video's thumbnail in
 # its "now playing" badge. THIS service fetches it and hands the bot a tiny raw RGB file (48x27, 3888 bytes).
-COVERS_ENABLED = os.environ.get("GONDOR_COVERS", "1").strip().lower() not in ("0", "false", "no", "off")
+COVERS_ENABLED = aenv.get("COVERS", "1").strip().lower() not in ("0", "false", "no", "off")
 COVER_W, COVER_H = 48, 27          # must match gif_art.COVER_W / COVER_H
 COVER_KEEP = 200                   # newest cover files kept in media_library
 COVER_WAIT = 4.0                   # max extra seconds a request waits for its cover
@@ -86,8 +87,8 @@ def _is_direct_media_url(q: str) -> bool:
 POLL_INTERVAL = 0.2            # dispatcher poll (was 2s)
 FG_WORKERS = 2                 # parallel foreground downloads (!play, first playlist track)
 BG_THROTTLE_SECONDS = (0.5, 2.0)  # random pause after each background (batch) download
-MAX_PLAYLIST_ITEMS = int(os.environ.get("GONDOR_MAX_PLAYLIST_ITEMS", "200"))
-RECENT_CACHE_SIZE = int(os.environ.get("GONDOR_RECENT_CACHE", "10"))  # played files kept for instant replay
+MAX_PLAYLIST_ITEMS = aenv.int_value("MAX_PLAYLIST_ITEMS", 200)
+RECENT_CACHE_SIZE = aenv.int_value("RECENT_CACHE", 10)  # played files kept for instant replay
 MEDIA_EXTS = (".webm", ".m4a", ".mp4", ".opus", ".mp3", ".ogg")
 
 _YT_HOST_RE = re.compile(r"(?:^|//)(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)\b", re.I)
@@ -185,9 +186,7 @@ if sys.platform == "win32":
 # exposes real audio-only formats (~3.4MB opus at ~128kbps) and is both smaller and faster.
 FAST_CLIENTS = ['tv_embedded']
 FALLBACK_CLIENTS = ['android', 'web', 'ios']
-AUDIO_FORMAT = os.environ.get(
-    "GONDOR_AUDIO_FORMAT", "bestaudio[abr<=130]/bestaudio/worstaudio/worst"
-)
+AUDIO_FORMAT = aenv.get("AUDIO_FORMAT", "bestaudio[abr<=130]/bestaudio/worstaudio/worst")
 
 
 def _youtube_ytdlp_opts(clients=None):
@@ -245,29 +244,29 @@ class SmartMediaCleaner:
         return cleaned_files
     
     def _is_file_in_playlist(self, file_path):
-        """Check if a file is referenced in any playlist (protects both original and copied files)"""
+        """Check if a file is referenced in any guild's playlist (protects permanent copies)."""
         try:
-            playlist_dir = Path("playlists")
-            if not playlist_dir.exists():
+            playlist_root = Path("playlists")
+            if not playlist_root.exists():
                 return False
             
-            file_str = str(file_path)
+            file_str = str(file_path).replace("\\", "/")
             file_name = Path(file_path).name
             
-            for playlist_file in playlist_dir.glob("*.json"):
+            # Layout: playlists/<guild_id>/*.json (and legacy playlists/*.json until migrated)
+            playlist_files = list(playlist_root.glob("*.json"))
+            playlist_files.extend(playlist_root.glob("*/*.json"))
+            
+            for playlist_file in playlist_files:
                 try:
                     with open(playlist_file, 'r') as f:
                         playlist_data = json.load(f)
                     
                     for song in playlist_data.get("files", []):
-                        # Check if this is the exact file path
-                        if song.get("audio_file") == file_str:
+                        stored = str(song.get("audio_file", "")).replace("\\", "/")
+                        if stored == file_str or stored.endswith("/" + file_name):
                             return True
-                        
-                        # Check if this is the original file that was copied to playlist
-                        # (compare filenames to catch the original before it gets deleted)
-                        playlist_file_name = Path(song.get("audio_file", "")).name
-                        if playlist_file_name == file_name:
+                        if Path(stored).name == file_name:
                             return True
                             
                 except Exception:
@@ -275,8 +274,7 @@ class SmartMediaCleaner:
             
             return False
         except Exception:
-            return False
-    
+            return False    
     def cleanup_by_size(self):
         """Remove oldest files to stay under max_cache_size"""
         webm_files = []
@@ -453,11 +451,11 @@ class AudioProcessor:
         self._ytdl_tmp = self.media_dir / "_ytdl_tmp"
         self._ytdl_tmp.mkdir(exist_ok=True)
 
-        ff = _gondor_ffmpeg()
+        ff = _arken_ffmpeg()
         if ff:
             self.audio_format_options["ffmpeg_location"] = ff
         else:
-            print("⚠️ ffmpeg not on PATH — set GONDOR_FFMPEG to a full path if downloads fail (WinError 22).")
+            print("⚠️ ffmpeg not on PATH — set ARKEN_FFMPEG to a full path if downloads fail (WinError 22).")
 
         self.audio_format_options.update(
             {
@@ -728,7 +726,7 @@ class AudioProcessor:
             if path.exists() and path.stat().st_size == want:
                 os.utime(path, None)
                 return str(path)
-            ffmpeg = _gondor_ffmpeg()
+            ffmpeg = _arken_ffmpeg()
             if not ffmpeg:
                 return None
             for name, vf in (("mqdefault", ""), ("hqdefault", "crop=iw:ih*3/4,")):  # hq has letterbox bars
@@ -904,17 +902,17 @@ class AudioProcessor:
 
     def process_lyrics(self, title, duration=0):
         """Synced (LRC) or plain lyrics for a track from LRCLIB (free, no key). Result carries the raw text."""
-        query = gondor_extras.lyric_query(title)
+        query = extras.lyric_query(title)
         if not query:
             return {"status": "error", "message": "no title to search lyrics for"}
         url = "https://lrclib.net/api/search?q=" + urllib.parse.quote(query)
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Gondor/1.0 (discord music bot)"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Arken/1.0 (discord music bot)"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 results = json.loads(r.read().decode("utf-8", "replace"))
         except Exception as e:
             return {"status": "error", "message": f"lyrics lookup failed: {e}"}
-        best = gondor_extras.pick_lyrics(results if isinstance(results, list) else [], duration or 0)
+        best = extras.pick_lyrics(results if isinstance(results, list) else [], duration or 0)
         if not best:
             return {"status": "error", "message": "no lyrics found for this track"}
         return {
@@ -932,7 +930,7 @@ class AudioProcessor:
         if video_id and re.fullmatch(r"[A-Za-z0-9_-]{6,20}", str(video_id)):
             targets.append(f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}")
         if title:
-            targets.append(f"ytsearch{max_items}:{gondor_extras.lyric_query(title)} mix")
+            targets.append(f"ytsearch{max_items}:{extras.lyric_query(title)} mix")
         for target in targets:
             try:
                 opts = self._flat_opts(extract_flat="in_playlist", noplaylist=False, playlistend=max_items,

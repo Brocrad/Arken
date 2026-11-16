@@ -11,8 +11,11 @@ media_library/
 request_queue/
 playlists/
 gif_cache/
+arken_data.json
+arken_settings.json
 gondor_data.json
 gondor_settings.json
+allowed_guilds.json
 playback_state.json
 voice_state.json
 user_whitelist.json

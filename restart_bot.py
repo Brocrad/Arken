@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gondor Bot Auto-Restart Manager
+Arken Bot Auto-Restart Manager
 Automatically restarts the bot if it crashes or is rebooted via !reboot command
 """
 
@@ -117,7 +117,7 @@ class BotManager:
     
     def run(self):
         """Main bot management loop"""
-        self.log("🤖 Gondor Bot Auto-Restart Manager Started")
+        self.log("🤖 Arken Bot Auto-Restart Manager Started")
         self.log(f"📝 Bot script: {BOT_SCRIPT}")
         self.log(f"⏱️ Restart delay: {RESTART_DELAY} seconds")
         self.log(f"🔄 Max restart attempts: {MAX_RESTART_ATTEMPTS}")

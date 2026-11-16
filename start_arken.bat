@@ -1,7 +1,7 @@
 @echo off
-title Gondor Audio System
+title Arken Audio System
 echo ================================
-echo    Gondor Audio System
+echo    Arken Audio System
 echo ================================
 echo.
 echo Starting audio streaming system...

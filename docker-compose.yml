@@ -1,17 +1,17 @@
 services:
-  gondor:
+  arken:
     build:
       context: .
       args:
         # Match the owner of ./data on the server (run `id -u` / `id -g`).
-        UID: ${GONDOR_UID:-1000}
-        GID: ${GONDOR_GID:-1000}
-    image: gondor:latest
-    container_name: gondor
+        UID: ${ARKEN_UID:-${GONDOR_UID:-1000}}
+        GID: ${ARKEN_GID:-${GONDOR_GID:-1000}}
+    image: arken:latest
+    container_name: arken
     # `!reboot` makes the bot exit cleanly (code 0), so this must be unless-stopped/always,
     # not on-failure.
     restart: unless-stopped
-    env_file: .env          # NEW_DISCORD_TOKEN and optional GONDOR_* toggles (never baked into the image)
+    env_file: .env          # NEW_DISCORD_TOKEN and optional ARKEN_* toggles (never baked into the image)
     volumes:
       # Persistent state: likes/history/stats, per-server settings, whitelist, saved session.
       - ./data:/data

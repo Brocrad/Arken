@@ -27,29 +27,29 @@ RUN apt-get update \
 # Non-root user. Override the uid/gid at build time if your host user isn't 1000.
 ARG UID=1000
 ARG GID=1000
-RUN groupadd --gid ${GID} gondor \
-    && useradd --uid ${UID} --gid ${GID} --create-home --shell /usr/sbin/nologin gondor
+RUN groupadd --gid ${GID} arken \
+    && useradd --uid ${UID} --gid ${GID} --create-home --shell /usr/sbin/nologin arken
 
-# venv is owned by the bot user so `!deps update` / GONDOR_AUTO_UPDATE_DEPS can pip-upgrade yt-dlp
+# venv is owned by the bot user so `!deps update` / ARKEN_AUTO_UPDATE_DEPS can pip-upgrade yt-dlp
 # (those upgrades live until the container is recreated; rebuild the image to make them permanent).
-COPY --from=builder --chown=gondor:gondor /opt/venv /opt/venv
+COPY --from=builder --chown=arken:arken /opt/venv /opt/venv
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONIOENCODING=utf-8 \
-    GONDOR_STATE_DIR=/data
+    ARKEN_STATE_DIR=/data
 
 WORKDIR /app
 # Bot, audio processor and caches all use paths relative to /app, so /app must be writable.
 # /data holds persistent state (mount a volume there); /app/playlists is mounted separately.
 RUN mkdir -p /app /data /app/playlists \
-    && chown -R gondor:gondor /app /data
+    && chown -R arken:arken /app /data
 
-COPY --chown=gondor:gondor *.py requirements.txt entrypoint.sh /app/
+COPY --chown=arken:arken *.py requirements.txt entrypoint.sh /app/
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
-USER gondor
+USER arken
 
 # The audio processor writes a heartbeat every 2s; unhealthy if it stopped for a minute.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=3 \

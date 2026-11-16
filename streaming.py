@@ -21,16 +21,11 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env before discord so GONDOR_* affects the voice stack.
+# Load .env before discord so ARKEN_* (or legacy GONDOR_*) affects the voice stack.
 try:
     load_dotenv()
 except Exception:
     print("WARNING: Skipping .env file due to encoding issues")
-
-
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
 
 # Windows default console encoding (e.g. cp1252) cannot encode emoji in print(); fix before any emoji output.
 if sys.platform == "win32":
@@ -52,7 +47,10 @@ from array import array
 from collections import deque, OrderedDict
 from types import SimpleNamespace
 
-import gondor_extras as extras  # effects, sleep timer, stats, likes, lyrics, game helpers (pure logic)
+import arken_env as aenv
+import arken_extras as extras  # effects, sleep timer, stats, likes, lyrics, game helpers (pure logic)
+import arken_tenancy as tenancy  # multi-server isolation foundation (guild-scoped personalization)
+import arken_metrics as metrics  # Prometheus textfile snapshots for Grafana later
 try:
     import audioop  # volume maths for fades (discord.py needs it for volume anyway)
 except ImportError:  # pragma: no cover
@@ -60,18 +58,18 @@ except ImportError:  # pragma: no cover
 
 # Optional: force IDENTIFY max_dave=0 (classic modes only). Do NOT enable by default — many guilds require DAVE;
 # a mismatch causes Discord to drop voice while discord.py reconnects → join/leave loop. Set explicitly in .env if needed.
-_use_dave = _env_truthy("GONDOR_VOICE_USE_DAVE")
-_no_dave = _env_truthy("GONDOR_VOICE_NO_DAVE")
+_use_dave = aenv.truthy("VOICE_USE_DAVE")
+_no_dave = aenv.truthy("VOICE_NO_DAVE")
 if _no_dave and not _use_dave:
 
-    def _gondor_legacy_max_dave_protocol_version(_self) -> int:
+    def _arken_legacy_max_dave_protocol_version(_self) -> int:
         return 0
 
     discord.voice_state.VoiceConnectionState.max_dave_protocol_version = property(
-        _gondor_legacy_max_dave_protocol_version
+        _arken_legacy_max_dave_protocol_version
     )
     print(
-        "🔧 GONDOR_VOICE_NO_DAVE: voice IDENTIFY uses max_dave=0. "
+        "🔧 ARKEN_VOICE_NO_DAVE: voice IDENTIFY uses max_dave=0. "
         "If the bot joins/leaves in a loop, remove this from .env."
     )
 
@@ -82,12 +80,12 @@ _ffmpeg_cached = None
 
 
 def get_ffmpeg_path():
-    """Locate FFmpeg portably: GONDOR_FFMPEG env var -> PATH -> a winget install -> legacy path."""
+    """Locate FFmpeg portably: ARKEN_FFMPEG env var -> PATH -> a winget install -> legacy path."""
     global _ffmpeg_cached
     if _ffmpeg_cached:
         return _ffmpeg_cached
     found = None
-    env = os.environ.get("GONDOR_FFMPEG", "").strip().strip('"')
+    env = aenv.get("FFMPEG", "").strip().strip('"')
     if env and os.path.isfile(env):
         found = env
     if not found:
@@ -127,15 +125,15 @@ print(f"   guilds: {intents.guilds}")
 
 bot = commands.Bot(command_prefix='!', intents=intents, description="File streaming utility")
 
-if os.environ.get("GONDOR_VOICE_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"):
+if aenv.get("VOICE_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"):
     logging.basicConfig(level=logging.DEBUG)
     logging.getLogger("discord.voice_state").setLevel(logging.DEBUG)
     logging.getLogger("discord.gateway").setLevel(logging.DEBUG)
-    print("🔧 GONDOR_VOICE_DEBUG: verbose discord voice logging enabled")
+    print("🔧 ARKEN_VOICE_DEBUG: verbose discord voice logging enabled")
 
 print(f"🔧 discord.py version: {discord.__version__}")
-if not _env_truthy("GONDOR_VOICE_RECONNECT"):
-    print("🔧 Voice: auto-reconnect after errors is OFF (stops 4006 loops). Set GONDOR_VOICE_RECONNECT=1 to restore.")
+if not aenv.truthy("VOICE_RECONNECT"):
+    print("🔧 Voice: auto-reconnect after errors is OFF (stops 4006 loops). Set ARKEN_VOICE_RECONNECT=1 to restore.")
 
 # Directories for communication with background service
 MEDIA_DIR = Path("media_library")
@@ -148,15 +146,27 @@ QUEUE_DIR.mkdir(exist_ok=True)
 def _state_file(name: str, default: Path | None = None) -> Path:
     """Where a small persistent JSON state file lives.
 
-    If GONDOR_STATE_DIR is set (e.g. /data in Docker) the file goes there, so one mounted volume holds
+    If ARKEN_STATE_DIR is set (e.g. /data in Docker) the file goes there, so one mounted volume holds
     all of it. Otherwise behaviour is unchanged: `default`, or `name` relative to the working directory.
     """
-    d = os.environ.get("GONDOR_STATE_DIR", "").strip()
+    d = aenv.get("STATE_DIR", "").strip()
     if d:
         p = Path(d)
         p.mkdir(parents=True, exist_ok=True)
         return p / name
     return default if default is not None else Path(name)
+
+
+def _resolve_state_json(primary: str, legacy: str) -> Path:
+    """Prefer Arken state filenames; use legacy names only if they already exist on disk."""
+    root = Path(__file__).resolve().parent
+    primary_p = _state_file(primary, root / primary)
+    legacy_p = _state_file(legacy, root / legacy)
+    if primary_p.is_file():
+        return primary_p
+    if legacy_p.is_file():
+        return legacy_p
+    return primary_p
 
 
 # Background audio processor (audio_processor_service.py) — spawned automatically unless already running
@@ -214,7 +224,7 @@ VOICE_LATENCY_GRACE = 30.0  # seconds after a join during which "no heartbeat ye
 def _mark_voice_joined(vc) -> None:
     """Remember when we joined: discord.py reports latency=inf until the first voice heartbeat is acked."""
     try:
-        vc._gondor_joined_at = time.monotonic()
+        vc._arken_joined_at = time.monotonic()
     except Exception:
         pass
 
@@ -230,15 +240,20 @@ def _voice_session_usable(vc: discord.VoiceClient | None) -> bool:
         return True
     # Connected but no heartbeat ack yet. Right after joining that is normal (the first voice
     # heartbeat can take ~10+ s), so don't report a healthy fresh join as broken.
-    joined = getattr(vc, "_gondor_joined_at", None)
+    joined = getattr(vc, "_arken_joined_at", None)
     return joined is not None and (time.monotonic() - joined) < VOICE_LATENCY_GRACE
 
 
 def _ensure_single_streaming_instance() -> None:
-    """Exclusive lock — two streaming.py processes cause 4006 + duplicate Discord messages."""
-    if _env_truthy("GONDOR_ALLOW_MULTI_INSTANCE"):
+    """Exclusive lock — two streaming.py processes on the same token cause 4006 + duplicate messages.
+
+    Multi-token pools run one process per ARKEN_TOKEN_ID; each uses its own lock file.
+    """
+    if aenv.truthy("ALLOW_MULTI_INSTANCE"):
         return
-    lock_path = _project_root() / ".gondor_streaming.lock"
+    token_tag = (aenv.get("TOKEN_ID") or "").strip()
+    lock_name = f".arken_streaming_{token_tag}.lock" if token_tag else ".arken_streaming.lock"
+    lock_path = _project_root() / lock_name
     pid_bytes = str(os.getpid()).encode("ascii")
 
     def try_create_lock() -> bool:
@@ -329,9 +344,9 @@ def _kill_audio_processor_from_pidfile() -> None:
 
 
 def _ensure_audio_processor_subprocess() -> None:
-    """Start queue consumer unless GONDOR_SKIP_AUDIO_PROCESSOR=1 or another instance is alive."""
-    if os.environ.get("GONDOR_SKIP_AUDIO_PROCESSOR", "").strip() in ("1", "true", "yes"):
-        print("⚠️ Skipping audio processor spawn (GONDOR_SKIP_AUDIO_PROCESSOR)")
+    """Start queue consumer unless ARKEN_SKIP_AUDIO_PROCESSOR=1 or another instance is alive."""
+    if aenv.get("SKIP_AUDIO_PROCESSOR", "").strip() in ("1", "true", "yes"):
+        print("⚠️ Skipping audio processor spawn (ARKEN_SKIP_AUDIO_PROCESSOR)")
         return
     if _audio_processor_already_running():
         pid_file = _project_root() / "request_queue" / ".audio_processor.pid"
@@ -381,9 +396,14 @@ atexit.register(_terminate_audio_processor_child)
 # Track current playback
 current_sources = {}
 
-# Playlist management directory
+# Playlist root. Each Discord server's playlists live under playlists/<guild_id>/ only.
 PLAYLIST_DIR = Path("playlists")
 PLAYLIST_DIR.mkdir(exist_ok=True)
+
+
+def _guild_playlists(guild_id) -> Path:
+    """playlists/<guild_id>/ — never the shared root."""
+    return tenancy.playlist_dir(PLAYLIST_DIR, guild_id)
 
 # Playlist queue management with smart features
 playlist_queues = {}  # {guild_id: {"playlist_name": str, "songs": list, "original_songs": list, "current_index": int, "shuffle": bool, "loop_mode": str, "total_songs": int}}
@@ -535,7 +555,7 @@ async def connect_to_voice_channel(
             await asyncio.sleep(1.0)
 
         connect_timeout = min(max(timeout, 10.0), 90.0)
-        voice_reconnect = _env_truthy("GONDOR_VOICE_RECONNECT")
+        voice_reconnect = aenv.truthy("VOICE_RECONNECT")
         new_vc = await asyncio.wait_for(
             channel.connect(
                 timeout=connect_timeout,
@@ -573,6 +593,10 @@ async def rejoin_voice_channels():
             
             if not guild:
                 print(f"⚠️ Guild {state['guild_name']} not found, skipping")
+                continue
+
+            if not guild_served_here(guild_id):
+                print(f"⚠️ Guild {guild.name} not served by this token, skipping rejoin")
                 continue
             
             # Find the voice channel
@@ -847,80 +871,415 @@ async def restore_playback_state():
         print("📢 No playback was restored")
 
 # ============================================================================
-# 🛡️ WHITELIST SECURITY SYSTEM
+# 🛡️ ACCESS CONTROL — three layers
+#
+#   1. Staff (user_whitelist.json)     global elevation tiers:
+#        owner     manage staff/guilds/runtime + diagnose + DJ in every server
+#        operator  manage guilds/runtime + diagnose — NOT cross-server DJ
+#      Only owner gets global_control. Playback in a friend’s server follows THAT server’s
+#      openplay / DJ role / Manage Server — operators are not elevated there.
+#   2. Server policy (per guild)       openplay (default ON) · DJ role · Manage Server
+#   3. Registry (allowed_guilds.json)  which Discord servers may use Arken at all
+#
+#   Command bands inside an approved server:
+#        user          summon, queue, like, history, stats, dashboard, voteskip, …
+#        dj / control  play, skip, volume, … (openplay OR dj role OR Manage Server OR owner)
+#        server admin  !openplay, !djrole (Discord Manage Server, or staff owner)
+#        staff         !guilds, !reboot, !whitelist, … (capability-gated)
 # ============================================================================
 
 WHITELIST_FILE = _state_file("user_whitelist.json")
+STAFF = tenancy.StaffDirectory(WHITELIST_FILE)
+GUILD_REGISTRY = tenancy.GuildRegistry(_state_file("allowed_guilds.json"))
+LEAVE_UNAPPROVED = aenv.get("LEAVE_UNAPPROVED", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Multi-token pool: sticky guild → bot-token assignment (see arken_tenancy.TokenPool).
+# Single-bot installs leave ARKEN_TOKEN_POOL unset and behave exactly as before.
+TOKEN_ID = (aenv.get("TOKEN_ID") or "").strip() or None
+_pool_ids = tenancy.parse_token_pool_env(aenv.get("TOKEN_POOL"))
+if not _pool_ids and TOKEN_ID:
+    _pool_ids = [TOKEN_ID]
+
+
+TOKEN_POOL = tenancy.TokenPool(
+    _state_file("token_pool.json"),
+    token_ids=_pool_ids,
+    max_guilds_per_token=aenv.int_value("MAX_GUILDS_PER_TOKEN", tenancy.DEFAULT_MAX_GUILDS_PER_TOKEN),
+    weight_guild=aenv.float_value("POOL_WEIGHT_GUILD", tenancy.DEFAULT_WEIGHT_GUILD),
+    weight_active=aenv.float_value("POOL_WEIGHT_ACTIVE", tenancy.DEFAULT_WEIGHT_ACTIVE),
+    weight_members=aenv.float_value("POOL_WEIGHT_MEMBERS", tenancy.DEFAULT_WEIGHT_MEMBERS),
+)
+if TOKEN_POOL.enabled() and not TOKEN_ID:
+    print(
+        "⚠️ ARKEN_TOKEN_POOL is set but ARKEN_TOKEN_ID is missing — "
+        "this process will not serve any assigned guilds until TOKEN_ID is set."
+    )
+
+_METRICS_ENABLED = aenv.get("METRICS", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+_METRICS_WRITER = None
+if _METRICS_ENABLED:
+    _metrics_dir = aenv.get("STATE_DIR", "").strip() or str(_project_root())
+    _METRICS_WRITER = metrics.MetricsWriter(
+        metrics.default_metrics_path(_metrics_dir, TOKEN_ID)
+    )
+
 
 def load_whitelist():
-    """Load authorized users from whitelist file"""
-    try:
-        if WHITELIST_FILE.exists():
-            with open(WHITELIST_FILE, 'r') as f:
-                data = json.load(f)
-                return set(data.get('authorized_users', []))
-        return set()
-    except Exception as e:
-        print(f"⚠️ Error loading whitelist: {e}")
-        return set()
+    """Staff user ids (any role). Kept for older call sites / sync helpers."""
+    return STAFF.ids()
+
 
 def save_whitelist(authorized_users):
-    """Save authorized users to whitelist file"""
+    """Replace staff list; unknown ids become owners. Prefer STAFF.set_role / remove."""
+    keep = {int(u) for u in authorized_users}
+    for uid in list(STAFF.ids()):
+        if uid not in keep:
+            STAFF.remove(uid)
+    for uid in keep:
+        if STAFF.role_of(uid) is None:
+            STAFF.set_role(uid, "owner")
+    return True
+
+
+def staff_role(user_id) -> str | None:
+    return STAFF.role_of(user_id)
+
+
+def staff_has(user_id, capability: str) -> bool:
+    return STAFF.has(user_id, capability)
+
+
+def is_owner(user_id) -> bool:
+    """Staff role 'owner' (highest tier). Not the same as Discord server admin."""
+    return staff_role(user_id) == "owner"
+
+
+def is_authorized(user_id) -> bool:
+    """Any staff member (owner / operator)."""
+    return STAFF.is_staff(user_id)
+
+
+def guild_is_approved(guild_id) -> bool:
+    """Whether this Discord server may use Arken. Until the registry exists, allow (seeded on ready)."""
+    if not GUILD_REGISTRY.initialized:
+        return True
+    return GUILD_REGISTRY.is_approved(guild_id)
+
+
+def guild_served_here(guild_id) -> bool:
+    """Approved for Arken AND assigned to this process's token (when the pool is enabled)."""
+    if not guild_is_approved(guild_id):
+        return False
+    if not TOKEN_POOL.enabled():
+        return True
+    if not TOKEN_ID:
+        return False
+    return TOKEN_POOL.token_of(guild_id) == TOKEN_ID
+
+
+async def _sync_seat_nickname(guild) -> bool:
+    """Set this bot's *per-server* nickname to the full seat (Token · Location).
+
+    One Discord bot (city-token) sits in up to 5 guilds. Each guild gets a different nickname
+    so members see e.g. "Osgiliath · East Bank" in the member list — not bare "Osgiliath".
+    Requires Change Nickname (or Manage Nicknames) for the bot. No-op if pool is off.
+    """
+    if guild is None or not TOKEN_POOL.enabled():
+        return False
+    if TOKEN_ID and TOKEN_POOL.token_of(guild.id) not in (None, TOKEN_ID):
+        return False
+    seat = TOKEN_POOL.seat_of(guild.id)
+    if not seat:
+        return False
+    # Discord nicknames max out at 32 characters.
+    nick = seat if len(seat) <= 32 else (seat[:31] + "…")
+    me = guild.me
+    if me is None:
+        return False
+    current = me.nick or me.display_name
+    if current == nick:
+        return True
     try:
-        data = {
-            'authorized_users': list(authorized_users),
-            'last_updated': time.time()
-        }
-        with open(WHITELIST_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
+        await me.edit(nick=nick, reason=f"Arken seat: {seat}")
+        print(f"🛡️ Nickname in {guild.name} → {nick}")
         return True
     except Exception as e:
-        print(f"⚠️ Error saving whitelist: {e}")
+        print(
+            f"⚠️ Could not set seat nickname in {guild.name} to '{nick}': {e} "
+            f"(need Change Nickname permission)"
+        )
         return False
 
-def is_authorized(user_id):
-    """Check if user is authorized to use administrative functions"""
-    authorized_users = load_whitelist()
-    return user_id in authorized_users
 
-def require_authorization():
-    """Decorator to require whitelist authorization for commands"""
+def _guild_member_count(guild) -> int:
+    try:
+        n = getattr(guild, "member_count", None)
+        if n is not None:
+            return max(0, int(n))
+    except Exception:
+        pass
+    try:
+        return max(0, len(guild.members))
+    except Exception:
+        return 0
+
+
+def _count_active_players() -> int:
+    n = 0
+    for g in bot.guilds:
+        if not guild_served_here(g.id):
+            continue
+        vc = g.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            n += 1
+    return n
+
+
+def _write_pool_metrics() -> None:
+    if not _METRICS_WRITER:
+        return
+    try:
+        snap = TOKEN_POOL.snapshot() if TOKEN_POOL.enabled() else {
+            "enabled": False,
+            "max_guilds_per_token": tenancy.DEFAULT_MAX_GUILDS_PER_TOKEN,
+            "token_count": 0,
+            "assigned_guilds": 0,
+            "tokens": [],
+        }
+        _METRICS_WRITER.write(metrics.render_pool_prometheus(snap, token_id=TOKEN_ID))
+    except Exception as e:
+        print(f"⚠️ metrics write failed: {e}")
+
+
+async def _pool_stats_loop():
+    """Refresh per-token active players + member counts; emit Prometheus textfile."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            if TOKEN_POOL.enabled() and TOKEN_ID:
+                dirty = False
+                for g in bot.guilds:
+                    if TOKEN_POOL.token_of(g.id) == TOKEN_ID:
+                        dirty = (
+                            TOKEN_POOL.update_guild_members(
+                                g.id, _guild_member_count(g), name=g.name, persist=False
+                            )
+                            or dirty
+                        )
+                        await _sync_seat_nickname(g)
+                TOKEN_POOL.set_runtime(
+                    TOKEN_ID, active_players=_count_active_players(), persist=False
+                )
+                if dirty:
+                    TOKEN_POOL.touch()
+                else:
+                    # Still refresh runtime timestamp occasionally for other processes.
+                    TOKEN_POOL.touch()
+            _write_pool_metrics()
+        except Exception as e:
+            print(f"⚠️ pool stats loop: {e}")
+        await asyncio.sleep(30)
+
+
+def openplay_enabled(guild_id) -> bool:
+    """Open play defaults ON so a newly approved server works without setup."""
+    return bool(guild_setting(guild_id, "openplay", tenancy.DEFAULT_OPENPLAY))
+
+
+def _member_is_admin(member) -> bool:
+    try:
+        return bool(member.guild_permissions.manage_guild or member.guild_permissions.administrator)
+    except Exception:
+        return False
+
+
+def _member_has_dj(member) -> bool:
+    role_id = guild_setting(member.guild.id, "dj_role")
+    if not role_id:
+        return False
+    try:
+        rid = int(role_id)
+    except (TypeError, ValueError):
+        return False
+    return any(r.id == rid for r in getattr(member, "roles", []))
+
+
+def member_can_control(member) -> bool:
+    """DJ / playback controls in this server.
+
+    Cross-server elevation is owner-only. Operators are not DJs in friends' servers unless
+    that server's own openplay / DJ role / Manage Server allows them.
+    """
+    if member is None or getattr(member, "guild", None) is None:
+        return False
+    return tenancy.can_control(
+        global_control=is_owner(member.id),
+        is_admin=_member_is_admin(member),
+        has_dj_role=_member_has_dj(member),
+        open_play=openplay_enabled(member.guild.id),
+    )
+
+
+def member_can_server_admin(member) -> bool:
+    """Change this server's Arken policy (!openplay, !djrole)."""
+    if member is None or getattr(member, "guild", None) is None:
+        return False
+    return tenancy.can_server_admin(
+        is_staff_owner=is_owner(member.id),
+        is_guild_admin=_member_is_admin(member),
+    )
+
+
+async def _deny_unapproved(ctx) -> bool:
+    """True if the command should stop (guild missing, not approved, or not on this token)."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command only works inside a Discord server.")
+        return True
+    if not guild_is_approved(ctx.guild.id):
+        st = GUILD_REGISTRY.status(ctx.guild.id)
+        await ctx.send(
+            f"❌ This server is **{st}**. Staff must approve it with "
+            f"`!allowguild {ctx.guild.id}` before Arken will work here."
+        )
+        return True
+    if not guild_served_here(ctx.guild.id):
+        seat = TOKEN_POOL.seat_of(ctx.guild.id) if TOKEN_POOL.enabled() else None
+        tip = f" It is seated as **{seat}**." if seat else ""
+        await ctx.send(
+            f"❌ This server is approved but not served by this bot instance.{tip}"
+        )
+        return True
+    return False
+
+
+def require_staff(*capabilities: str):
+    """Decorator: staff member with ALL listed capabilities (default: any staff)."""
+    import functools
+    needed = tuple(capabilities)
+
     def decorator(func):
-        import functools
-        
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            # First argument should be ctx (context)
             ctx = args[0] if args else None
-            
-            if not ctx or not hasattr(ctx, 'author'):
-                # Fallback if ctx is not properly passed
+            if not ctx or not hasattr(ctx, "author"):
                 return await func(*args, **kwargs)
-            
-            if not is_authorized(ctx.author.id):
-                # Log unauthorized access attempt
-                command_name = ctx.command.name if hasattr(ctx, 'command') and ctx.command else 'unknown'
-                print(f"🚫 Unauthorized access attempt: {ctx.author} ({ctx.author.id}) tried to use {command_name}")
-                
-                # Send discrete denial message
-                await ctx.send("❌ **Access denied.** This command requires authorization.")
+            uid = ctx.author.id
+            if not STAFF.is_staff(uid):
+                print(f"🚫 Staff denied: {ctx.author} ({uid}) tried {getattr(ctx.command, 'name', '?')}")
+                await ctx.send("❌ **Access denied.** Arken staff only.")
                 return
-            
-            # User is authorized, proceed with command
+            missing = [c for c in needed if not staff_has(uid, c)]
+            if missing:
+                role = staff_role(uid) or "?"
+                print(f"🚫 Capability denied ({missing}): {ctx.author} role={role}")
+                await ctx.send(
+                    f"❌ **Access denied.** Your staff role (`{role}`) cannot do that. "
+                    f"Need: {', '.join(missing)}."
+                )
+                return
             return await func(*args, **kwargs)
-        
+
         return wrapper
+
     return decorator
 
-# Load whitelist on startup
-authorized_users = load_whitelist()
-print(f"🛡️ Whitelist loaded: {len(authorized_users)} authorized users")
 
-def _env_flag(name, default="1"):
-    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "off")
+def require_owner():
+    """Decorator: staff role owner only (manage_staff and everything else)."""
+    return require_staff("manage_staff")
 
 
-NP_REACTIVE = _env_flag("GONDOR_NP_REACTIVE")  # equalizer bars follow the real audio spectrum
+def require_server_admin():
+    """Decorator: Discord Manage Server (or staff owner) in an approved guild."""
+    import functools
+
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            ctx = args[0] if args else None
+            if not ctx or not hasattr(ctx, "author"):
+                return await func(*args, **kwargs)
+            if await _deny_unapproved(ctx):
+                return
+            if not member_can_server_admin(ctx.author):
+                await ctx.send("❌ **Access denied.** Need Manage Server (or be an Arken owner).")
+                return
+            return await func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def require_control():
+    """Decorator: DJ / playback — openplay (default on) | DJ role | server admin | staff global_control."""
+    import functools
+
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            ctx = args[0] if args else None
+            if not ctx or not hasattr(ctx, "author"):
+                return await func(*args, **kwargs)
+            if await _deny_unapproved(ctx):
+                return
+            if not member_can_control(ctx.author):
+                print(f"🚫 Control denied: {ctx.author} ({ctx.author.id}) tried {getattr(ctx.command, 'name', '?')}")
+                await ctx.send(
+                    "❌ **Access denied.** Need the DJ role, Manage Server, "
+                    "`!openplay on`, or be an Arken owner."
+                )
+                return
+            return await func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def require_user():
+    """Decorator: any member in an approved guild (listening / personal commands)."""
+    import functools
+
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            ctx = args[0] if args else None
+            if not ctx or not hasattr(ctx, "author"):
+                return await func(*args, **kwargs)
+            if await _deny_unapproved(ctx):
+                return
+            return await func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def require_authorization():
+    """Alias of require_control (DJ / playback)."""
+    return require_control()
+
+
+_staff_counts = ", ".join(
+    f"{r}={sum(1 for m in STAFF.all().values() if m.get('role') == r)}"
+    for r in tenancy.STAFF_ROLE_ORDER
+)
+print(f"🛡️ Staff loaded: {len(STAFF.ids())} ({_staff_counts})")
+print(
+    "🛡️ Guild registry: "
+    + (
+        f"ready ({len(GUILD_REGISTRY.all())} servers)"
+        if GUILD_REGISTRY.initialized
+        else "will seed on first ready"
+    )
+)
+
+NP_REACTIVE = aenv.flag("NP_REACTIVE")  # equalizer bars follow the real audio spectrum
 _SPECTRUM_FRAMES = 3                            # 3 x 20ms of audio per analysis
 _SAMPLE_RATE = 48000
 _FFT_N = 2048
@@ -1280,7 +1639,9 @@ async def _play_next_playlist_song_inner(guild_id):
                         description=f"Finished playing playlist: **{result.get('playlist_name', 'Unknown')}**",
                         color=0x4caf50
                     )
-                    rain = await _scene_file(("rain", None), style_for(guild_id)) if BADGES_ENABLED else None
+                    rain = await _scene_file(
+                        ("rain", None), style_for(guild_id), guild_id=guild_id
+                    ) if BADGES_ENABLED else None
                     if rain is not None:
                         embed.set_image(url=f"attachment://{rain.filename}")
                         await channels[0].send(embed=embed, file=rain)
@@ -1401,15 +1762,15 @@ class PlaylistManager:
     """Air-gapped playlist management - only references local files"""
     
     @staticmethod
-    def create_playlist(name):
-        """Create a new empty playlist"""
+    def create_playlist(guild_id, name):
+        """Create a new empty playlist in this server's folder only."""
         try:
             # Sanitize playlist name
             safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
             if not safe_name:
                 return {"status": "error", "message": "Invalid playlist name"}
             
-            playlist_file = PLAYLIST_DIR / f"{safe_name}.json"
+            playlist_file = _guild_playlists(guild_id) / f"{safe_name}.json"
             
             if playlist_file.exists():
                 return {"status": "error", "message": f"Playlist '{safe_name}' already exists"}
@@ -1430,11 +1791,11 @@ class PlaylistManager:
             return {"status": "error", "message": f"Failed to create playlist: {str(e)}"}
     
     @staticmethod
-    def list_playlists():
-        """List all available playlists"""
+    def list_playlists(guild_id):
+        """List playlists belonging to this Discord server only."""
         try:
             playlists = []
-            for playlist_file in PLAYLIST_DIR.glob("*.json"):
+            for playlist_file in _guild_playlists(guild_id).glob("*.json"):
                 try:
                     with open(playlist_file, 'r') as f:
                         data = json.load(f)
@@ -1486,11 +1847,12 @@ class PlaylistManager:
             return {"status": "error", "message": f"Failed to get media files: {str(e)}"}
     
     @staticmethod
-    def add_song_to_playlist(playlist_name, current_file_path, song_title, duration=0):
-        """Add currently playing song to playlist (air-gap safe)"""
+    def add_song_to_playlist(guild_id, playlist_name, current_file_path, song_title, duration=0):
+        """Add currently playing song to a playlist in this server only (air-gap safe)"""
         try:
+            gdir = _guild_playlists(guild_id)
             # Validate playlist exists
-            playlist_file = PLAYLIST_DIR / f"{playlist_name}.json"
+            playlist_file = gdir / f"{playlist_name}.json"
             if not playlist_file.exists():
                 return {"status": "error", "message": f"Playlist '{playlist_name}' not found"}
             
@@ -1500,7 +1862,7 @@ class PlaylistManager:
                 return {"status": "error", "message": "Current audio file not found"}
             
             # Create playlist-specific directory for permanent storage
-            playlist_media_dir = PLAYLIST_DIR / playlist_name
+            playlist_media_dir = gdir / playlist_name
             playlist_media_dir.mkdir(exist_ok=True)
             
             # Generate unique filename for playlist storage
@@ -1539,11 +1901,17 @@ class PlaylistManager:
             with open(playlist_file, 'r') as f:
                 playlist_data = json.load(f)
             
-            # Add song entry to playlist
+            # Store portable paths under playlists/<guild_id>/… (never another server's folder)
+            audio_rel = tenancy.scope_playlist_path(
+                str(Path("playlists") / str(guild_id) / playlist_name / audio_filename), guild_id
+            )
+            meta_rel = tenancy.scope_playlist_path(
+                str(Path("playlists") / str(guild_id) / playlist_name / metadata_filename), guild_id
+            )
             song_entry = {
                 "title": song_title,
-                "audio_file": str(permanent_audio_path),
-                "metadata_file": str(permanent_metadata_path),
+                "audio_file": audio_rel,
+                "metadata_file": meta_rel,
                 "duration": duration,
                 "added": time.time()
             }
@@ -1558,17 +1926,17 @@ class PlaylistManager:
             return {
                 "status": "success", 
                 "message": f"Added '{song_title}' to playlist '{playlist_name}'",
-                "permanent_file": str(permanent_audio_path)
+                "permanent_file": audio_rel
             }
             
         except Exception as e:
             return {"status": "error", "message": f"Failed to add song to playlist: {str(e)}"}
     
     @staticmethod
-    def get_playlist_contents(playlist_name):
-        """Get contents of a specific playlist"""
+    def get_playlist_contents(guild_id, playlist_name):
+        """Get contents of a playlist in this server only."""
         try:
-            playlist_file = PLAYLIST_DIR / f"{playlist_name}.json"
+            playlist_file = _guild_playlists(guild_id) / f"{playlist_name}.json"
             if not playlist_file.exists():
                 return {"status": "error", "message": f"Playlist '{playlist_name}' not found"}
             
@@ -1581,10 +1949,10 @@ class PlaylistManager:
             return {"status": "error", "message": f"Failed to get playlist contents: {str(e)}"}
     
     @staticmethod
-    def clean_playlist(playlist_name):
+    def clean_playlist(guild_id, playlist_name):
         """Remove missing files from playlist JSON"""
         try:
-            result = PlaylistManager.get_playlist_contents(playlist_name)
+            result = PlaylistManager.get_playlist_contents(guild_id, playlist_name)
             if result["status"] != "success":
                 return result
             
@@ -1609,7 +1977,7 @@ class PlaylistManager:
                 playlist["total_duration"] = sum(song.get("duration", 0) for song in valid_songs)
                 
                 # Save updated playlist
-                playlist_file = Path(f"playlists/{playlist_name}.json")
+                playlist_file = _guild_playlists(guild_id) / f"{playlist_name}.json"
                 with open(playlist_file, 'w', encoding='utf-8') as f:
                     json.dump(playlist, f, indent=2, ensure_ascii=False)
                 
@@ -1630,11 +1998,11 @@ class PlaylistManager:
         """Start playing a playlist (air-gap safe - only local files)"""
         try:
             # First clean the playlist to remove any missing files
-            clean_result = PlaylistManager.clean_playlist(playlist_name)
+            clean_result = PlaylistManager.clean_playlist(guild_id, playlist_name)
             if clean_result["status"] == "success" and "removed" in clean_result["message"]:
                 print(f"🧹 {clean_result['message']}")
             
-            result = PlaylistManager.get_playlist_contents(playlist_name)
+            result = PlaylistManager.get_playlist_contents(guild_id, playlist_name)
             if result["status"] != "success":
                 return result
             
@@ -1662,6 +2030,7 @@ class PlaylistManager:
             
             # Set up playlist queue with smart features
             playlist_queues[guild_id] = {
+                "guild_id": guild_id,
                 "playlist_name": playlist_name,
                 "songs": valid_songs.copy(),  # Current playing order
                 "original_songs": valid_songs.copy(),  # Original order for un-shuffle
@@ -1905,7 +2274,58 @@ def queue_cleanup_all_request():
 async def on_ready():
     print(f"✅ {bot.user.name} is online!")
     print(f"📁 Connected to {len(bot.guilds)} servers")
-    
+    if TOKEN_POOL.enabled():
+        print(
+            f"🛡️ Token pool: id={TOKEN_ID or '?'} · "
+            f"{len(TOKEN_POOL.token_ids)} token(s) · "
+            f"cap {TOKEN_POOL.max_guilds_per_token} guilds/token"
+        )
+
+    # First run: approve every server we're already in so existing setups keep working.
+    seeded = GUILD_REGISTRY.seed([(g.id, g.name) for g in bot.guilds])
+    if seeded:
+        print(f"🛡️ Guild registry seeded with {seeded} existing server(s)")
+    for guild in list(bot.guilds):
+        status = GUILD_REGISTRY.seen(guild.id, guild.name)
+        if status != "approved":
+            print(f"⚠️ Server not approved ({status}): {guild.name} ({guild.id})")
+            if LEAVE_UNAPPROVED:
+                try:
+                    await guild.leave()
+                    print(f"👋 Left unapproved server {guild.name} (ARKEN_LEAVE_UNAPPROVED=1)")
+                except Exception as e:
+                    print(f"⚠️ Could not leave {guild.name}: {e}")
+            continue
+
+        # Pool mode: claim unassigned approved guilds for this token, leave ones owned elsewhere.
+        if TOKEN_POOL.enabled() and TOKEN_ID:
+            owner = TOKEN_POOL.token_of(guild.id)
+            members = _guild_member_count(guild)
+            if owner is None:
+                try:
+                    TOKEN_POOL.assign(
+                        guild.id, token_id=TOKEN_ID, members=members, name=guild.name
+                    )
+                    seat = TOKEN_POOL.seat_of(guild.id)
+                    print(f"🛡️ Claimed {guild.name} → {seat or TOKEN_ID}")
+                    await _sync_seat_nickname(guild)
+                except (tenancy.PoolFullError, tenancy.CallsignExhaustedError) as e:
+                    print(f"⚠️ Cannot claim {guild.name}: {e}")
+                    try:
+                        await guild.leave()
+                        print(f"👋 Left {guild.name} (this token is at guild cap)")
+                    except Exception as leave_err:
+                        print(f"⚠️ Could not leave {guild.name}: {leave_err}")
+            elif owner != TOKEN_ID:
+                print(f"🛡️ {guild.name} belongs to token {owner} — leaving")
+                try:
+                    await guild.leave()
+                except Exception as e:
+                    print(f"⚠️ Could not leave {guild.name}: {e}")
+            else:
+                TOKEN_POOL.update_guild_members(guild.id, members, name=guild.name)
+                await _sync_seat_nickname(guild)
+
     # Check intents status
     print("\n🔍 INTENT STATUS CHECK:")
     print(f"   Message Content Intent: {bot.intents.message_content}")
@@ -1924,7 +2344,10 @@ async def on_ready():
     if bot.guilds:
         print(f"\n📋 Connected to {len(bot.guilds)} server(s):")
         for guild in bot.guilds:
-            print(f"   • {guild.name} (ID: {guild.id})")
+            st = GUILD_REGISTRY.status(guild.id)
+            seat = TOKEN_POOL.seat_of(guild.id) if TOKEN_POOL.enabled() else None
+            seat_s = f" · {seat}" if seat else ""
+            print(f"   • {guild.name} (ID: {guild.id}) [{st}{seat_s}]")
             # Check bot permissions in each server
             perms = guild.me.guild_permissions
             print(f"     Permissions: Read Messages={perms.read_messages}, Send Messages={perms.send_messages}")
@@ -1932,8 +2355,12 @@ async def on_ready():
     print("\n🎮 Audio streaming bot ready!")
     print("📁 File streaming service online")
     print("💡 Try typing '!commands' to test if the bot can see messages")
+
+    if not getattr(bot, "_arken_pool_stats_started", False):
+        bot._arken_pool_stats_started = True
+        bot.loop.create_task(_pool_stats_loop())
     
-    # Auto-rejoin voice channels after restart
+    # Auto-rejoin voice channels after restart (approved servers only)
     print("\n🔊 Checking for voice channels to rejoin...")
     await rejoin_voice_channels()
     
@@ -1941,35 +2368,84 @@ async def on_ready():
     print("🎵 Checking for playback state to restore...")
     await restore_playback_state()
     
-    # Queue cleanup of any leftover files from previous runs (only if no playback was restored)
+    # Queue cleanup of leftover cache only when nothing is playing anywhere
     playback_state = load_playback_state()
-    if not playback_state:
+    if not playback_state and not any(
+        vc and (vc.is_playing() or vc.is_paused()) for g in bot.guilds for vc in (g.voice_client,)
+    ):
         queue_cleanup_all_request()
     else:
-        print("🎵 Skipping cleanup - playback state exists")
+        print("🎵 Skipping cleanup — playback state or active voice exists")
 
 @bot.event
 async def on_disconnect():
-    """Handle Discord disconnection"""
+    """Handle Discord disconnection. Do not wipe media_library — other guilds may still need files."""
     print("🔌 Bot disconnected from Discord")
-    
-    # Queue cleanup of any remaining files on disconnect
+
+@bot.event
+async def on_guild_join(guild):
+    """New invite: mark pending until an owner approves. Optionally leave immediately."""
+    status = GUILD_REGISTRY.seen(guild.id, guild.name)
+    print(f"📥 Joined {guild.name} ({guild.id}) — status={status}")
+
+    if status == "approved" and TOKEN_POOL.enabled() and TOKEN_ID:
+        owner = TOKEN_POOL.token_of(guild.id)
+        members = _guild_member_count(guild)
+        if owner is None:
+            try:
+                TOKEN_POOL.assign(
+                    guild.id, token_id=TOKEN_ID, members=members, name=guild.name
+                )
+                seat = TOKEN_POOL.seat_of(guild.id)
+                print(f"🛡️ Claimed approved {guild.name} → {seat or TOKEN_ID}")
+                await _sync_seat_nickname(guild)
+                return
+            except (tenancy.PoolFullError, tenancy.CallsignExhaustedError):
+                print(f"⚠️ Approved {guild.name} but this token is at cap — leaving")
+                try:
+                    await guild.leave()
+                except Exception:
+                    pass
+                return
+        if owner != TOKEN_ID:
+            print(f"🛡️ {guild.name} is assigned to token {owner} — leaving")
+            try:
+                await guild.leave()
+            except Exception:
+                pass
+            return
+        TOKEN_POOL.update_guild_members(guild.id, members, name=guild.name)
+        await _sync_seat_nickname(guild)
+        return
+
+    if status == "approved":
+        await _sync_seat_nickname(guild)
+        return
+    notice = (
+        f"Arken joined **{guild.name}** but this server is **{status}**. "
+        f"An owner must run `!allowguild {guild.id}` before music works here."
+    )
+    print(f"🛡️ {notice}")
+    # Try to tell the system channel; ignore failures (missing perms).
     try:
-        cleanup_id = str(uuid.uuid4())[:8]
-        cleanup_request = {
-            'type': 'cleanup_all',
-            'cleanup_id': cleanup_id,
-            'timestamp': time.time(),
-            'reason': 'shutdown_cleanup'
-        }
-        
-        cleanup_file = QUEUE_DIR / f"cleanup_all_{cleanup_id}.json"
-        with open(cleanup_file, 'w') as f:
-            json.dump(cleanup_request, f, indent=2)
-        
-        print(f"🧹 Queued shutdown cleanup")
-    except Exception as e:
-        print(f"⚠️ Failed to queue shutdown cleanup: {e}")
+        if guild.system_channel is not None:
+            await guild.system_channel.send(
+                f"👋 {notice}"
+            )
+    except Exception:
+        pass
+    if LEAVE_UNAPPROVED or status == "revoked":
+        try:
+            await guild.leave()
+            print(f"👋 Left {guild.name} (unapproved/revoked)")
+        except Exception as e:
+            print(f"⚠️ Could not leave {guild.name}: {e}")
+
+
+@bot.event
+async def on_guild_remove(guild):
+    print(f"📤 Removed from {guild.name} ({guild.id})")
+
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -2204,7 +2680,7 @@ def _format_progress(prog):
 #    vapor.* status builders return a StatusText: the body without a header plus `.badge` (the label).
 #    BadgeHeader.sync() keeps that header message in step and only re-uploads when the badge CHANGES,
 #    so progress edits stay text-only and cheap. If a GIF can't be built, the text header is used.
-#    Disable with GONDOR_GIFS=0.
+#    Disable with ARKEN_GIFS=0.
 # ----------------------------------------------------------------------------
 
 BADGES_ENABLED = vapor.BADGES
@@ -2213,21 +2689,25 @@ if BADGES_ENABLED:
     threading.Thread(target=gif_art.prewarm, daemon=True, name="gif-prewarm").start()
 
 
-async def _scene_file(scene, style=None):
+async def _scene_file(scene, style=None, *, guild_id=None):
     """discord.File for a terminal-scene GIF ('crash' with its error text, 'shutdown', 'rain'), or None."""
     kind, text = scene
+    theme = guild_gif_theme(guild_id)
     try:
-        data = await asyncio.to_thread(gif_art.terminal_bytes, kind, gif_art.resolve_style(style), text)
+        data = await asyncio.to_thread(
+            gif_art.terminal_bytes, kind, gif_art.resolve_style(style), text, theme
+        )
         return discord.File(io.BytesIO(data), filename=f"{kind}.gif")
     except Exception as e:
         print(f"⚠️ terminal GIF unavailable ({kind}): {e}")
         return None
 
 
-async def _badge_file(label, style=None, cover=None):
+async def _badge_file(label, style=None, cover=None, theme=None):
     """discord.File for a badge GIF, or None if it can't be built."""
+    theme = theme or gif_art.GuildTheme.default()
     try:
-        data = await asyncio.to_thread(gif_art.header_bytes, label, style, cover)
+        data = await asyncio.to_thread(gif_art.header_bytes, label, style, cover, theme)
         return discord.File(io.BytesIO(data), filename=gif_art.slug(label) + ".gif")
     except Exception as e:
         print(f"⚠️ badge GIF unavailable ({label}): {e}")
@@ -2261,13 +2741,20 @@ class BadgeHeader:
         fallback = getattr(text, "fallback", None) or str(text)  # same text WITH a text header
         if self._dead:
             return fallback
-        style = gif_art.effective_style(self.style or style_for(_dest_guild_id(dest)), self.cover)
-        key = (scene or badge, style, self.cover.key if self.cover is not None else None)
+        gid = _dest_guild_id(dest)
+        theme = guild_gif_theme(gid)
+        style = gif_art.effective_style(self.style or style_for(gid), self.cover)
+        theme_key = theme.cache_key()
+        key = (scene or badge, style, self.cover.key if self.cover is not None else None, theme_key)
         if key == self._key and self.msg is not None:
             return str(text)
-        file = await (_scene_file(scene, style) if scene else _badge_file(badge, style, self.cover))
+        file = await (
+            _scene_file(scene, style, guild_id=gid)
+            if scene
+            else _badge_file(badge, style, self.cover, theme)
+        )
         if file is None:
-            return fallback
+            return _vapor_fallback_branded(fallback, theme.badge_brand())
         try:
             if self.msg is None:
                 self.msg = await dest.send(file=file)
@@ -2377,9 +2864,9 @@ class StatusMessage:
 #     `keep` moves each finished track into playlists/<name>/ permanently
 # ============================================================================
 
-STREAM_BATCH_SIZE = max(1, int(os.environ.get("GONDOR_BATCH_SIZE", "5")))
-STREAM_LOW_WATER = max(0, int(os.environ.get("GONDOR_LOW_WATER", "2")))
-MAX_IMPORT_ITEMS = max(1, int(os.environ.get("GONDOR_MAX_PLAYLIST_ITEMS", "200")))
+STREAM_BATCH_SIZE = max(1, int(aenv.get("BATCH_SIZE", "5")))
+STREAM_LOW_WATER = max(0, int(aenv.get("LOW_WATER", "2")))
+MAX_IMPORT_ITEMS = max(1, int(aenv.get("MAX_PLAYLIST_ITEMS", "200")))
 
 stream_tasks = {}          # guild_id -> (asyncio.Task, queue)
 stream_status_msgs = {}    # guild_id -> StatusMessage
@@ -2452,10 +2939,11 @@ def _stream_entry_failed(stream, entry, message):
 
 
 def _stream_keep_entry(queue, entry):
-    """`keep` mode: move the finished file into playlists/<name>/ and record it in the permanent playlist."""
+    """`keep` mode: move the finished file into playlists/<guild_id>/<name>/ for this server only."""
     stream = queue["stream"]
     name = stream["name"]
-    pdir = PLAYLIST_DIR / name
+    guild_id = queue["guild_id"]
+    pdir = _guild_playlists(guild_id) / name
     pdir.mkdir(exist_ok=True)
 
     src = Path(entry["audio_file"])
@@ -2472,10 +2960,16 @@ def _stream_keep_entry(queue, entry):
         with open(meta_dest, 'w', encoding='utf-8') as f:
             json.dump({"title": entry["title"], "duration": entry["duration"], "video_id": entry["video_id"]}, f, indent=2)
 
-    entry["audio_file"] = str(dest)
-    entry["metadata_file"] = str(meta_dest)
+    audio_rel = tenancy.scope_playlist_path(
+        str(Path("playlists") / str(guild_id) / name / dest.name), guild_id
+    )
+    meta_rel = tenancy.scope_playlist_path(
+        str(Path("playlists") / str(guild_id) / name / meta_dest.name), guild_id
+    )
+    entry["audio_file"] = audio_rel
+    entry["metadata_file"] = meta_rel
 
-    playlist_file = PLAYLIST_DIR / f"{name}.json"
+    playlist_file = _guild_playlists(guild_id) / f"{name}.json"
     if playlist_file.exists():
         with open(playlist_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -2483,8 +2977,8 @@ def _stream_keep_entry(queue, entry):
         data = {"name": name, "created": time.time(), "files": [], "total_duration": 0}
     data["files"].append({
         "title": entry["title"],
-        "audio_file": str(dest),
-        "metadata_file": str(meta_dest),
+        "audio_file": audio_rel,
+        "metadata_file": meta_rel,
         "duration": entry["duration"],
         "added": time.time(),
         "video_id": entry["video_id"],
@@ -2497,7 +2991,7 @@ def _stream_keep_entry(queue, entry):
 def _stream_prefill_from_playlist(queue):
     """`keep` mode: tracks already saved in the permanent playlist need no download."""
     stream = queue["stream"]
-    playlist_file = PLAYLIST_DIR / f"{stream['name']}.json"
+    playlist_file = _guild_playlists(queue["guild_id"]) / f"{stream['name']}.json"
     if not playlist_file.exists():
         return
     try:
@@ -2779,6 +3273,7 @@ async def _begin_playlist_import(ctx, url, keep=False, shuffle=False, custom_nam
         safe_name = f"import_{int(time.time())}"
 
     queue = {
+        "guild_id": guild_id,
         "playlist_name": safe_name or yt_title,
         "songs": list(entries),
         "original_songs": list(entries),   # same dict objects -> status updates are shared
@@ -2841,15 +3336,15 @@ def _restore_stream_session(guild_id):
 
 
 # ============================================================================
-# 🍩 SUMMON ANIMATION — spinning ASCII donut (donut.c) while Gondor connects to voice
+# 🍩 SUMMON ANIMATION — spinning ASCII donut (donut.c) while Arken connects to voice
 #    One message, edited every ~0.3s (Discord throttles to ~1/s after a short burst; frames are
 #    picked by elapsed time so the spin speed stays constant even when throttled). Frames are
-#    pre-rendered once in a background thread. Disable with GONDOR_DONUT=0.
+#    pre-rendered once in a background thread. Disable with ARKEN_DONUT=0.
 # ============================================================================
 
-DONUT_ENABLED = os.environ.get("GONDOR_DONUT", "1").strip().lower() not in ("0", "false", "no", "off")
-DONUT_MIN_SECONDS = float(os.environ.get("GONDOR_DONUT_SECONDS", "4"))  # play at least this long
-DONUT_FRAME_INTERVAL = float(os.environ.get("GONDOR_DONUT_INTERVAL", "0.3"))  # seconds per frame (Discord allows ~5 edits/5s, so ~1/s sustained)
+DONUT_ENABLED = aenv.get("DONUT", "1").strip().lower() not in ("0", "false", "no", "off")
+DONUT_MIN_SECONDS = float(aenv.get("DONUT_SECONDS", "4"))  # play at least this long
+DONUT_FRAME_INTERVAL = float(aenv.get("DONUT_INTERVAL", "0.3"))  # seconds per frame (Discord allows ~5 edits/5s, so ~1/s sustained)
 
 if DONUT_ENABLED:
     threading.Thread(target=donut.get_frames, daemon=True, name="donut-prewarm").start()
@@ -2955,16 +3450,20 @@ async def _start_summon_animation(ctx, channel_name):
     """Send the spinning donut (GIF, or text frames as a fallback). Returns (message, animation or None)."""
     if not DONUT_ENABLED:
         return await ctx.send(f"🎵 Connecting to **{channel_name}**..."), None
+    gid = _dest_guild_id(ctx)
+    theme = guild_gif_theme(gid)
     if BADGES_ENABLED:
         try:
-            data = await asyncio.to_thread(gif_art.donut_bytes, gif_art.resolve_style(style_for(_dest_guild_id(ctx))))
+            data = await asyncio.to_thread(
+                gif_art.donut_bytes, gif_art.resolve_style(style_for(gid)), theme
+            )
             msg = await ctx.send(file=discord.File(io.BytesIO(data), filename="summoning.gif"))
             return msg, GifSummon(msg)
         except Exception as e:
             print(f"⚠️ donut GIF unavailable, using text donut: {e}")
     frames = await asyncio.to_thread(donut.get_frames)
     # Caption must stay within the donut's width, or Discord wraps the code block and scrambles it.
-    caption = "~ summoning gondor ~".center(donut.WIDTH).rstrip()
+    caption = f"~ summoning {theme.summon} ~".center(donut.WIDTH).rstrip()
     msg = await ctx.send(_donut_message(frames[0], caption))
     anim = DonutAnimation(msg, frames, caption)
     anim.start()
@@ -2980,16 +3479,16 @@ async def _finish_summon(msg, anim, content):
 
 # ============================================================================
 # ⚙️ SETTINGS, SHORT NOTES, PLAYBACK CONTROLS
-#    gondor_settings.json keeps per-server `!style` and volume. Notes are short replies with an animated
-#    badge that delete themselves after GONDOR_NOTE_SECONDS (0 = keep). The control helpers are shared by
+#    arken_settings.json keeps per-server `!style` and volume. Notes are short replies with an animated
+#    badge that delete themselves after ARKEN_NOTE_SECONDS (0 = keep). The control helpers are shared by
 #    the chat commands and the now-playing buttons so both behave identically.
 # ============================================================================
 
-SETTINGS_FILE = _state_file("gondor_settings.json", Path(__file__).resolve().parent / "gondor_settings.json")
-NOTE_SECONDS = max(0.0, float(os.environ.get("GONDOR_NOTE_SECONDS", "12")))
-PRESENCE_ENABLED = _env_flag("GONDOR_PRESENCE")
-NP_COUNTDOWN = _env_flag("GONDOR_NP_COUNTDOWN")
-NP_BUTTONS_ENABLED = _env_flag("GONDOR_NP_BUTTONS")
+SETTINGS_FILE = _resolve_state_json("arken_settings.json", "gondor_settings.json")
+NOTE_SECONDS = max(0.0, float(aenv.get("NOTE_SECONDS", "12")))
+PRESENCE_ENABLED = aenv.flag("PRESENCE")
+NP_COUNTDOWN = aenv.flag("NP_COUNTDOWN")
+NP_BUTTONS_ENABLED = aenv.flag("NP_BUTTONS")
 DEFAULT_VOLUME = 0.8
 SEEK_STEP = 10  # seconds for !forward / !rewind and the skip buttons
 SCRUB_STEPS = 20  # jump points offered in the scrub dropdown (every 100/SCRUB_STEPS % of the track)
@@ -3035,6 +3534,33 @@ def style_for(guild_id):
         return gif_art.DEFAULT_STYLE
     pref = guild_setting(guild_id, "style")
     return "auto" if pref == "auto" else gif_art.resolve_style(pref)   # "auto": colours follow the cover art
+
+
+def _vapor_fallback_branded(fallback: str | None, brand: str) -> str:
+    """Prefix text fallbacks with the guild seat when GIF generation fails."""
+    if not fallback or not brand:
+        return fallback or ""
+    tag = f"**{brand}**"
+    if fallback.startswith("```"):
+        nl = fallback.find("\n")
+        if nl != -1:
+            return fallback[: nl + 1] + f"{tag}\n" + fallback[nl + 1 :]
+    return f"{tag}\n{fallback}"
+
+
+def guild_gif_theme(guild_id) -> gif_art.GuildTheme:
+    """Terminal GIF chrome for this server (city seat when assigned, else guild slug)."""
+    if not guild_id:
+        return gif_art.GuildTheme.default()
+    if TOKEN_POOL.enabled():
+        tid = TOKEN_POOL.token_of(guild_id)
+        cs = TOKEN_POOL.callsign_of(guild_id)
+        if tid and cs:
+            return gif_art.GuildTheme.from_seat(TOKEN_POOL.seat_of(guild_id), cs, tid)
+    guild = bot.get_guild(int(guild_id))
+    if guild and guild.name:
+        return gif_art.GuildTheme.from_guild_name(guild.name)
+    return gif_art.GuildTheme.default()
 
 
 def load_cover(path):
@@ -3108,16 +3634,21 @@ _presence_name = object()
 
 
 async def update_presence():
-    """'Listening to <song>' on the bot's profile while something plays; cleared when nothing does."""
+    """Bot profile status. Song titles only when in exactly one server — otherwise they would leak."""
     global _presence_name
     if not PRESENCE_ENABLED:
         return
-    title = None
+    titles = []
     for src in list(current_sources.values()):
         t = getattr(src, "title", None)
-        if t and not getattr(src, "game", False):   # a guessing-game clip must not give the answer away
-            title = str(t)
-    name = title[:120] if title else None
+        if t and not getattr(src, "game", False):  # guessing-game clips must not give the answer away
+            titles.append(str(t))
+    # Profile status is global on the Discord account; never show another server's song.
+    shown = tenancy.presence_title(len(bot.guilds), titles)
+    if shown is None and titles:
+        name = tenancy.NEUTRAL_PRESENCE
+    else:
+        name = shown
     if name == _presence_name:
         return
     _presence_name = name
@@ -3282,11 +3813,11 @@ def seek_current(guild_id, *, to=None, by=None):
 #    One tracker per guild. Position comes from SimpleAudioSource.elapsed (audio frames actually
 #    played, so pauses are handled). The message is edited every NP_INTERVAL seconds; Discord allows
 #    ~5 edits / 5s per channel, so 3s leaves plenty of room for the bot's other messages.
-#    Disable with GONDOR_NP_LIVE=0 (messages then stay static, as before).
+#    Disable with ARKEN_NP_LIVE=0 (messages then stay static, as before).
 # ============================================================================
 
-NP_LIVE_ENABLED = os.environ.get("GONDOR_NP_LIVE", "1").strip().lower() not in ("0", "false", "no", "off")
-NP_INTERVAL = max(1.0, float(os.environ.get("GONDOR_NP_INTERVAL", "3")))
+NP_LIVE_ENABLED = aenv.get("NP_LIVE", "1").strip().lower() not in ("0", "false", "no", "off")
+NP_INTERVAL = max(1.0, float(aenv.get("NP_INTERVAL", "3")))
 NP_TICK = 0.5  # how often we check whether the track ended (so the final edit is prompt)
 
 _np_trackers = {}  # guild_id -> NowPlayingTracker
@@ -3303,8 +3834,10 @@ class JumpModal(discord.ui.Modal, title="Jump to a time"):
         self.add_item(self.time_input)
 
     async def on_submit(self, interaction):
-        if not is_authorized(interaction.user.id):
-            await interaction.response.send_message("❌ **Access denied.** This needs authorization.",
+        guild = interaction.guild or bot.get_guild(self.guild_id)
+        member = guild.get_member(interaction.user.id) if guild else None
+        if member is None or not member_can_control(member):
+            await interaction.response.send_message("❌ **Access denied.** This needs DJ / admin / openplay.",
                                                     ephemeral=True, delete_after=6)
             return
         try:
@@ -3410,11 +3943,16 @@ class NowPlayingView(discord.ui.View):
         if interaction.guild_id != self.guild_id:
             await interaction.response.send_message("❌ These buttons belong to another server.", ephemeral=True)
             return False
-        if need_auth and not is_authorized(interaction.user.id):
-            print(f"🚫 Unauthorized button press: {interaction.user} ({interaction.user.id})")
-            await interaction.response.send_message("❌ **Access denied.** This needs authorization.",
-                                                    ephemeral=True, delete_after=6)
-            return False
+        if need_auth:
+            guild = interaction.guild or bot.get_guild(self.guild_id)
+            member = guild.get_member(interaction.user.id) if guild else None
+            if member is None or not member_can_control(member):
+                print(f"🚫 Unauthorized button press: {interaction.user} ({interaction.user.id})")
+                await interaction.response.send_message(
+                    "❌ **Access denied.** Need Manage Server, the DJ role, openplay, or be a bot owner.",
+                    ephemeral=True, delete_after=6,
+                )
+                return False
         return True
 
     async def _done(self, interaction, ok, text):
@@ -3677,16 +4215,18 @@ def now_playing_text(source, title, duration, cached=False):
     return vapor.now_playing(title, duration_str, cached)
 
 
-@bot.command(name="test", help="Test if bot is responding to commands")
+@bot.command(name="test", help="Test if bot is responding (staff: diagnose)")
+@require_staff("diagnose")
 async def test(ctx):
     """Simple test command to verify bot is working"""
     print(f"🧪 TEST COMMAND RECEIVED from {ctx.author} ({ctx.author.id}) in {ctx.guild.name}")
     await ctx.send("✅ **Bot is working!** I can see your commands. Try `!summon` now.")
 
 @bot.command(name="summon", help="Summon the bot to your voice channel")
+@require_user()
 async def summon(ctx):
     print(f"📥 Received !summon command from {ctx.author} ({ctx.author.id}) in {ctx.guild.name}")
-    
+
     if not ctx.author.voice or not ctx.author.voice.channel:
         print(f"❌ User {ctx.author} is not in a voice channel")
         await ctx.send("❌ You need to be in a voice channel to summon me!")
@@ -4062,7 +4602,7 @@ async def rewind_cmd(ctx, seconds: str = None):
 @bot.command(name="style", help="Change the look of the animated badges (vaporwave, matrix, sunset, synthwave, auto)")
 @require_authorization()
 async def style_cmd(ctx, name: str = None):
-    names = gif_art.style_names() + ("auto",)   # "auto": colours follow each song's cover art
+    names = gif_art.style_names() + ("auto",)   # "auto": colours follow each song's cover art; seat labels theme terminal GIFs
     current = style_for(ctx.guild.id)
     if name is None:
         await reply_note(ctx, vapor.note("style", f"current: {current}", "options: " + ", ".join(names)))
@@ -4108,7 +4648,9 @@ async def kill(ctx):
 
         current_sources.pop(ctx.guild.id, None)
         await ctx.guild.voice_client.disconnect()
-        scene = await _scene_file(("shutdown", None), style_for(ctx.guild.id)) if BADGES_ENABLED else None
+        scene = await _scene_file(
+            ("shutdown", None), style_for(ctx.guild.id), guild_id=ctx.guild.id
+        ) if BADGES_ENABLED else None
         if scene is not None:
             await ctx.send("👋 **Disconnected**", file=scene)
         else:
@@ -4120,7 +4662,7 @@ async def kill(ctx):
 async def show_commands(ctx):
     """Show help"""
     embed = discord.Embed(
-        title="🎵 Gondor Music Bot Commands",
+        title="🎵 Arken Music Bot Commands",
         description="⚠️ **Important:** Use `!summon` first to bring me to your voice channel!\n\nYour advanced Discord music bot with media management!",
         color=0x00ff00
     )
@@ -4174,24 +4716,43 @@ async def show_commands(ctx):
         inline=False
     )
     
-    # Only show admin commands to authorized users
-    if is_authorized(ctx.author.id):
+    embed.add_field(
+        name="👤 User (everyone)",
+        value="`!summon` `!kill` `!queue` `!like` `!history` `!stats` `!dashboard` `!voteskip`",
+        inline=False,
+    )
+    embed.add_field(
+        name="🎧 DJ controls",
+        value=(
+            "`!play` `!skip` `!volume` `!playlist` `!effect` `!autoplay` …\n"
+            "Allowed when **openplay** is on (default), or you have the DJ role / Manage Server "
+            "(or are an Arken **owner**)."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛠️ Server admin",
+        value="`!openplay [on|off]` (default **on**) · `!djrole @Role | off`",
+        inline=False,
+    )
+
+    role = staff_role(ctx.author.id)
+    if role:
         embed.add_field(
-            name="🛡️ Admin Commands",
+            name=f"🛡️ Staff (`{role}`)",
             value=(
-                "`!whitelist` - Show authorized users\n"
-                "`!whitelist add <user|id>` - Add user to whitelist\n"
-                "`!whitelist remove <user|id>` - Remove user from whitelist\n"
-                "`!whitelist check <user|id>` - Check user authorization\n"
-                "`!reboot` - Restart the bot\n"
-                "`!rejoin` - Rejoin saved voice channels\n"
-                "`!deps update` - Upgrade pip packages from requirements.txt"
+                "`!guilds` `!tokens` `!allowguild` `!leaveguild` · `!whitelist` "
+                "`!reboot` `!deps` `!diagnose` — gated by your role's capabilities"
             ),
-            inline=False
+            inline=False,
         )
-        embed.set_footer(text="🛡️ You have administrative access")
+        embed.set_footer(text=f"Staff role: {role}")
+    elif member_can_server_admin(ctx.author):
+        embed.set_footer(text="You can change this server's Arken policy")
+    elif member_can_control(ctx.author):
+        embed.set_footer(text="You can use DJ controls in this server")
     else:
-        embed.set_footer(text="Some commands require authorization")
+        embed.set_footer(text="Open play is off — ask an admin for the DJ role")
     
     embed.add_field(
         name="📋 Playlist Commands",
@@ -4228,7 +4789,8 @@ async def show_commands(ctx):
     embed.set_footer(text="Use !commands to see this message anytime • Made with ❤️")
     await ctx.send(embed=embed)
 
-@bot.command(name="diagnose", help="Run diagnostics to check bot functionality")
+@bot.command(name="diagnose", help="Run diagnostics (staff: diagnose)")
+@require_staff("diagnose")
 async def diagnose(ctx):
     """Run diagnostic tests for the bot system"""
     
@@ -4306,7 +4868,8 @@ async def diagnose(ctx):
     
     await ctx.send(embed=embed)
 
-@bot.command(name="nettest", help="Test network connectivity to Discord voice servers")
+@bot.command(name="nettest", help="Test network connectivity (staff: diagnose)")
+@require_staff("diagnose")
 async def nettest(ctx):
     """Test network connectivity for the bot system"""
     
@@ -4564,7 +5127,7 @@ async def playlist_cmd(ctx, action=None, *, args=None):
             await ctx.send("❌ Usage: `!playlist create <playlist name>`")
             return
         
-        result = PlaylistManager.create_playlist(args)
+        result = PlaylistManager.create_playlist(ctx.guild.id, args)
         
         if result["status"] == "success":
             await ctx.send(f"✅ {result['message']}")
@@ -4572,7 +5135,7 @@ async def playlist_cmd(ctx, action=None, *, args=None):
             await ctx.send(f"❌ {result['message']}")
     
     elif action.lower() == "list":
-        result = PlaylistManager.list_playlists()
+        result = PlaylistManager.list_playlists(ctx.guild.id)
         
         if result["status"] == "success":
             playlists = result["playlists"]
@@ -4625,6 +5188,7 @@ async def playlist_cmd(ctx, action=None, *, args=None):
         await asyncio.sleep(0.5)
         
         result = PlaylistManager.add_song_to_playlist(
+            ctx.guild.id,
             playlist_name, 
             current_source.file_path, 
             song_title, 
@@ -4777,7 +5341,7 @@ async def playlist_cmd(ctx, action=None, *, args=None):
             return
         
         playlist_name = args.strip()
-        result = PlaylistManager.clean_playlist(playlist_name)
+        result = PlaylistManager.clean_playlist(ctx.guild.id, playlist_name)
         
         if result["status"] == "success":
             if "removed" in result["message"]:
@@ -4813,7 +5377,7 @@ async def playlist_cmd(ctx, action=None, *, args=None):
             await ctx.send("❌ Usage: `!playlist show <playlist name>`")
             return
         
-        result = PlaylistManager.get_playlist_contents(args.strip())
+        result = PlaylistManager.get_playlist_contents(ctx.guild.id, args.strip())
         
         if result["status"] == "success":
             playlist = result["playlist"]
@@ -4986,8 +5550,8 @@ async def playlist_cmd(ctx, action=None, *, args=None):
     else:
         await ctx.send(f"❌ Unknown action: `{action}`. Use `!playlist` to see available commands.")
 
-@bot.command(name="region", help="Set regional audio settings")
-@require_authorization()
+@bot.command(name="region", help="Set regional audio settings (staff: diagnose)")
+@require_staff("diagnose")
 async def set_region(ctx, region: str = None):
     """Set regional audio processing settings"""
     global ffmpeg_options
@@ -5105,168 +5669,345 @@ async def resolve_user_id(ctx, user_input):
     
     return None, None
 
-@bot.command(name="whitelist", help="Manage authorized users")
-@require_authorization()
+def _split_user_and_role(text: str):
+    """'name operator' / '123456 owner' → (user_token, role_or_None)."""
+    parts = (text or "").strip().split()
+    if len(parts) >= 2 and tenancy.normalize_staff_role(parts[-1]):
+        return " ".join(parts[:-1]), tenancy.normalize_staff_role(parts[-1])
+    return text, None
+
+
+@bot.command(name="whitelist", help="Manage Arken staff roles: !whitelist [add|remove|check|set] …")
+@require_staff("manage_staff")
 async def whitelist_cmd(ctx, action=None, *, user_input=None):
-    """Manage the whitelist of authorized users - supports both user IDs and usernames"""
-    
+    """Global staff directory — not per-server DJs. Roles: owner, operator."""
+
     if not action:
-        # Show current whitelist
-        authorized_users = load_whitelist()
-        
+        staff = STAFF.all()
         embed = discord.Embed(
-            title="🛡️ Authorized Users",
-            description=f"Users with administrative access ({len(authorized_users)} total)",
-            color=0x00ff00
+            title="🛡️ Arken staff",
+            description=(
+                f"{len(staff)} staff member(s)\n"
+                f"**owner** — full elevation (incl. DJ in every server)\n"
+                f"**operator** — guilds / runtime / diagnose — no cross-server DJ"
+            ),
+            color=0x00ff00,
         )
-        
-        if authorized_users:
-            user_list = []
-            for user_id in authorized_users:
+        if staff:
+            lines = []
+            for uid, meta in sorted(staff.items(), key=lambda kv: (tenancy.STAFF_ROLE_ORDER.index(kv[1]["role"]) if kv[1]["role"] in tenancy.STAFF_ROLE_ORDER else 99, kv[0])):
                 try:
-                    user = await bot.fetch_user(user_id)
-                    user_list.append(f"• **{user.name}** (`{user_id}`)")
-                except:
-                    user_list.append(f"• Unknown User (`{user_id}`)")
-            
-            embed.add_field(
-                name="Authorized Users",
-                value="\n".join(user_list[:10]),  # Limit to 10 for display
-                inline=False
-            )
-            
-            if len(user_list) > 10:
-                embed.set_footer(text=f"... and {len(user_list) - 10} more users")
+                    user = await bot.fetch_user(int(uid))
+                    label = f"**{user.name}**"
+                except Exception:
+                    label = "Unknown"
+                lines.append(f"• {label} (`{uid}`) — `{meta['role']}`")
+            embed.add_field(name="Members", value="\n".join(lines[:20]), inline=False)
+            if len(lines) > 20:
+                embed.set_footer(text=f"… and {len(lines) - 20} more")
         else:
-            embed.add_field(
-                name="No Users",
-                value="No users are currently authorized.",
-                inline=False
-            )
-        
+            embed.add_field(name="Members", value="No staff yet.", inline=False)
         embed.add_field(
             name="Commands",
             value=(
-                "`!whitelist add <user_id|username>` - Add user to whitelist\n"
-                "`!whitelist remove <user_id|username>` - Remove user from whitelist\n"
-                "`!whitelist check <user_id|username>` - Check if user is authorized"
+                "`!whitelist add <user> [owner|operator]` — default owner\n"
+                "`!whitelist set <user> <role>` — change role\n"
+                "`!whitelist remove <user>` · `!whitelist check <user>`"
             ),
-            inline=False
+            inline=False,
         )
-        
         await ctx.send(embed=embed)
         return
-    
-    action = action.lower()
-    
-    if action == "add":
-        if not user_input:
-            await ctx.send("❌ **Missing user.** Usage: `!whitelist add <user_id|username>`")
-            return
-        
-        # Resolve user input to user ID
-        user_id, user = await resolve_user_id(ctx, user_input)
-        
-        if user_id is None:
-            await ctx.send(f"❌ **User not found:** `{user_input}`\nTry using their exact username or Discord user ID.")
-            return
-        
-        # Load current whitelist
-        authorized_users = load_whitelist()
-        
-        if user_id in authorized_users:
-            user_display = user.name if user else f"User {user_id}"
-            await ctx.send(f"⚠️ **{user_display} is already authorized.**")
-            return
-        
-        # Add user to whitelist
-        authorized_users.add(user_id)
-        
-        if save_whitelist(authorized_users):
-            if user:
-                await ctx.send(f"✅ **Added {user.name} (`{user_id}`) to whitelist.**")
-                print(f"🛡️ {ctx.author} added {user.name} ({user_id}) to whitelist")
-            else:
-                await ctx.send(f"✅ **Added user `{user_id}` to whitelist.**")
-                print(f"🛡️ {ctx.author} added user {user_id} to whitelist")
-        else:
-            await ctx.send("❌ **Failed to save whitelist.** Please try again.")
-    
-    elif action == "remove":
-        if not user_input:
-            await ctx.send("❌ **Missing user.** Usage: `!whitelist remove <user_id|username>`")
-            return
-        
-        # Resolve user input to user ID
-        user_id, user = await resolve_user_id(ctx, user_input)
-        
-        if user_id is None:
-            await ctx.send(f"❌ **User not found:** `{user_input}`\nTry using their exact username or Discord user ID.")
-            return
-        
-        # Prevent removing yourself if you're the last admin
-        authorized_users = load_whitelist()
-        
-        if user_id == ctx.author.id and len(authorized_users) == 1:
-            await ctx.send("❌ **Cannot remove yourself as the last authorized user.**")
-            return
-        
-        if user_id not in authorized_users:
-            user_display = user.name if user else f"User {user_id}"
-            await ctx.send(f"⚠️ **{user_display} is not in the whitelist.**")
-            return
-        
-        # Remove user from whitelist
-        authorized_users.discard(user_id)
-        
-        if save_whitelist(authorized_users):
-            if user:
-                await ctx.send(f"✅ **Removed {user.name} (`{user_id}`) from whitelist.**")
-                print(f"🛡️ {ctx.author} removed {user.name} ({user_id}) from whitelist")
-            else:
-                await ctx.send(f"✅ **Removed user `{user_id}` from whitelist.**")
-                print(f"🛡️ {ctx.author} removed user {user_id} from whitelist")
-        else:
-            await ctx.send("❌ **Failed to save whitelist.** Please try again.")
-    
-    elif action == "check":
-        if not user_input:
-            await ctx.send("❌ **Missing user.** Usage: `!whitelist check <user_id|username>`")
-            return
-        
-        # Resolve user input to user ID
-        user_id, user = await resolve_user_id(ctx, user_input)
-        
-        if user_id is None:
-            await ctx.send(f"❌ **User not found:** `{user_input}`\nTry using their exact username or Discord user ID.")
-            return
-        
-        authorized = is_authorized(user_id)
-        status = "✅ **Authorized**" if authorized else "❌ **Not Authorized**"
-        
-        if user:
-            await ctx.send(f"{status} - **{user.name}** (`{user_id}`)")
-        else:
-            await ctx.send(f"{status} - User `{user_id}`")
-    
-    else:
-        await ctx.send("❌ **Invalid action.** Use: `add`, `remove`, or `check`")
 
-@bot.command(name="deps", help="Upgrade Python dependencies (authorized)")
-@require_authorization()
+    action = action.lower()
+    if action in ("add", "set", "remove", "check") and not user_input:
+        await ctx.send(f"❌ Usage: `!whitelist {action} <user> [role]`")
+        return
+
+    if action in ("add", "set"):
+        user_token, role = _split_user_and_role(user_input)
+        role = role or ("owner" if action == "add" else None)
+        if action == "set" and not role:
+            await ctx.send("❌ Usage: `!whitelist set <user> <owner|operator>`")
+            return
+        user_id, user = await resolve_user_id(ctx, user_token)
+        if user_id is None:
+            await ctx.send(f"❌ **User not found:** `{user_token}`")
+            return
+        try:
+            applied = STAFF.set_role(user_id, role)
+        except ValueError as e:
+            await ctx.send(f"❌ {e}")
+            return
+        who = user.name if user else str(user_id)
+        verb = "Added" if action == "add" else "Updated"
+        await ctx.send(f"✅ **{verb} {who}** (`{user_id}`) as `{applied}`.")
+        print(f"🛡️ {ctx.author} {verb.lower()} staff {who} ({user_id}) role={applied}")
+        return
+
+    if action == "remove":
+        user_id, user = await resolve_user_id(ctx, user_input)
+        if user_id is None:
+            await ctx.send(f"❌ **User not found:** `{user_input}`")
+            return
+        owners = [uid for uid, m in STAFF.all().items() if m.get("role") == "owner"]
+        if str(user_id) in owners and len(owners) == 1:
+            await ctx.send("❌ **Cannot remove the last owner.**")
+            return
+        if not STAFF.remove(user_id):
+            await ctx.send("⚠️ That user is not on the staff list.")
+            return
+        who = user.name if user else str(user_id)
+        await ctx.send(f"✅ **Removed {who}** (`{user_id}`) from staff.")
+        print(f"🛡️ {ctx.author} removed staff {who} ({user_id})")
+        return
+
+    if action == "check":
+        user_id, user = await resolve_user_id(ctx, user_input)
+        if user_id is None:
+            await ctx.send(f"❌ **User not found:** `{user_input}`")
+            return
+        role = staff_role(user_id)
+        who = user.name if user else str(user_id)
+        if not role:
+            await ctx.send(f"❌ **{who}** (`{user_id}`) is not staff.")
+            return
+        caps = ", ".join(sorted(tenancy.role_capabilities(role))) or "(none)"
+        await ctx.send(f"✅ **{who}** (`{user_id}`) — role `{role}`\nCapabilities: {caps}")
+        return
+
+    await ctx.send("❌ Use: `add`, `set`, `remove`, or `check`")
+
+
+@bot.command(name="guilds", help="List Discord servers and approval status (staff: manage_guilds)")
+@require_staff("manage_guilds")
+async def guilds_cmd(ctx):
+    """Show every known server and whether Arken may run there."""
+    rows = []
+    connected = {g.id: g for g in bot.guilds}
+    for gid, info in sorted(GUILD_REGISTRY.all().items(), key=lambda kv: kv[1].get("name") or kv[0]):
+        g = connected.get(int(gid))
+        mark = "🟢" if info.get("status") == "approved" else ("🟡" if info.get("status") == "pending" else "🔴")
+        here = " · connected" if g else ""
+        seat = TOKEN_POOL.seat_of(gid) if TOKEN_POOL.enabled() else None
+        seat_s = f" · **{seat}**" if seat else ""
+        voice = ""
+        if g and g.voice_client and g.voice_client.channel:
+            src = current_sources.get(g.id)
+            title = getattr(src, "title", None) if src else None
+            voice = f" · 🔊 {g.voice_client.channel.name}"
+            if title:
+                voice += f" · {title[:40]}"
+        rows.append(
+            f"{mark} **{info.get('name') or gid}** (`{gid}`) — {info.get('status')}{seat_s}{here}{voice}"
+        )
+    for g in bot.guilds:
+        if str(g.id) not in GUILD_REGISTRY.all():
+            rows.append(f"⚪ **{g.name}** (`{g.id}`) — unknown")
+    embed = discord.Embed(
+        title="🛡️ Arken servers",
+        description="\n".join(rows) if rows else "No servers recorded yet.",
+        color=0x00bcd4,
+    )
+    footer = "!allowguild <id> · !leaveguild <id> [--purge]"
+    if TOKEN_POOL.enabled():
+        footer += " · !tokens"
+    embed.set_footer(text=footer)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="tokens", aliases=["tokenpool", "pool"], help="Show token-pool load balance (staff: manage_guilds)")
+@require_staff("manage_guilds")
+async def tokens_cmd(ctx):
+    if not TOKEN_POOL.enabled():
+        await ctx.send(
+            "ℹ️ Token pool is **off**. Set `ARKEN_TOKEN_POOL` + `ARKEN_TOKEN_ID` "
+            "(one process per Discord bot token) to enable balancing."
+        )
+        return
+    snap = TOKEN_POOL.snapshot()
+    here_name = tenancy.display_token_name(TOKEN_ID) if TOKEN_ID else "?"
+    lines = [
+        f"This process: **{here_name}** (`{TOKEN_ID or '?'}`) · "
+        f"cap **{snap['max_guilds_per_token']}** guilds/token",
+        f"Assigned guilds: **{snap['assigned_guilds']}** across **{snap['token_count']}** token(s)",
+        "",
+    ]
+    for tok in snap["tokens"]:
+        mark = "🔴" if tok["at_cap"] else ("🟢" if tok["slots_free"] else "🟡")
+        mine = " ← here" if tok["token_id"] == TOKEN_ID else ""
+        city = tok.get("display_name") or tok["token_id"]
+        lines.append(
+            f"{mark} **{city}** (`{tok['token_id']}`){mine} — "
+            f"{tok['guilds']}/{snap['max_guilds_per_token']} guilds · "
+            f"{tok['members_total']} members · "
+            f"{tok['active_players']} playing · "
+            f"score {tok['load_score']}"
+        )
+        for seat in tok.get("seats") or []:
+            label = seat.get("seat") or seat.get("callsign") or "?"
+            gname = seat.get("name") or seat.get("guild_id")
+            lines.append(f" · {label} — {gname} (`{seat.get('guild_id')}`)")
+        free = tok.get("callsigns_free") or []
+        if free:
+            free_labels = ", ".join(tenancy.display_callsign_name(cs) for cs in free)
+            lines.append(f" · free seats: {free_labels}")
+    embed = discord.Embed(
+        title="⚖️ Token pool",
+        description="\n".join(lines),
+        color=0x7e57c2,
+    )
+    embed.set_footer(
+        text="City = token · Location = guild seat · sticky until !leaveguild"
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="allowguild", aliases=["approveguild"], help="Approve a Discord server (staff: manage_guilds)")
+@require_staff("manage_guilds")
+async def allowguild_cmd(ctx, guild_id: str = None, *, note: str = None):
+    if not guild_id or not guild_id.isdigit():
+        await ctx.send("❌ Usage: `!allowguild <server_id> [note]`")
+        return
+    gid = int(guild_id)
+    g = bot.get_guild(gid)
+    members = _guild_member_count(g) if g else 0
+    assigned = None
+    seat = None
+    if TOKEN_POOL.enabled():
+        try:
+            assigned = TOKEN_POOL.assign(
+                gid,
+                members=members or None,
+                name=g.name if g else None,
+            )
+            seat = TOKEN_POOL.seat_of(gid)
+        except tenancy.PoolFullError as e:
+            await ctx.send(f"❌ Cannot approve — token pool is full: {e}")
+            return
+        except tenancy.CallsignExhaustedError as e:
+            await ctx.send(f"❌ Cannot approve — no free callsign on that token: {e}")
+            return
+    GUILD_REGISTRY.approve(gid, name=g.name if g else None, note=note)
+    if g is not None and seat and guild_served_here(gid):
+        await _sync_seat_nickname(g)
+    msg = f"✅ Approved server `{gid}`" + (f" (**{g.name}**)" if g else "") + "."
+    if seat:
+        msg += (
+            f" Seat **{seat}** — members will see the bot as **{seat}** "
+            f"in that server (per-server nickname)."
+        )
+    elif assigned:
+        msg += f" Assigned to token `{assigned}`."
+    if assigned:
+        if TOKEN_ID and assigned != TOKEN_ID:
+            city = tenancy.display_token_name(assigned)
+            msg += (
+                f" Invite the **{city}** bot into the server "
+                f"(this instance is **{tenancy.display_token_name(TOKEN_ID)}** and will not serve it)."
+            )
+        elif g is None:
+            msg += " Invite the assigned bot into the server if it is not already there."
+    await ctx.send(msg)
+
+
+@bot.command(name="leaveguild", help="Leave a Discord server; optional --purge (staff: manage_guilds)")
+@require_staff("manage_guilds")
+async def leaveguild_cmd(ctx, guild_id: str = None, *, flags: str = None):
+    if not guild_id or not guild_id.isdigit():
+        await ctx.send("❌ Usage: `!leaveguild <server_id> [--purge]`")
+        return
+    gid = int(guild_id)
+    purge = bool(flags and "--purge" in flags.lower())
+    GUILD_REGISTRY.revoke(gid)
+    if TOKEN_POOL.enabled():
+        TOKEN_POOL.release(gid)
+    g = bot.get_guild(gid)
+    left = False
+    if g is not None:
+        try:
+            await g.leave()
+            left = True
+        except Exception as e:
+            await ctx.send(f"⚠️ Revoked, but leave failed: {e}")
+            return
+    msg = f"👋 Revoked `{gid}`" + (" and left." if left else " (was not connected).")
+    if purge:
+        with DATA.lock:
+            removed = tenancy.purge_guild_data(DATA.data, PLAYLIST_DIR, gid)
+            if removed["data"]:
+                DATA.save()
+        if str(gid) in _settings:
+            del _settings[str(gid)]
+            try:
+                _write_json_atomic(SETTINGS_FILE, _settings)
+            except Exception:
+                pass
+        msg += f" Purged stored data={removed['data']} playlists={removed['playlists_dir']}."
+    await ctx.send(msg)
+
+
+@bot.command(name="openplay", help="Let everyone use DJ controls: !openplay [on|off] (default on)")
+@require_server_admin()
+async def openplay_cmd(ctx, state: str = None):
+    """Server policy. Default is ON for new/unset servers."""
+    if state is None:
+        on = openplay_enabled(ctx.guild.id)
+        await ctx.send(
+            f"🔓 Open play is **{'on' if on else 'off'}** in this server "
+            f"(default is **on** until changed)."
+        )
+        return
+    val = state.strip().lower() in ("1", "on", "true", "yes", "open")
+    set_guild_setting(ctx.guild.id, "openplay", val)
+    await ctx.send(
+        f"🔓 Open play **{'enabled' if val else 'disabled'}** — "
+        f"{'anyone can use DJ controls' if val else 'only DJ role, Manage Server, or Arken owner'}."
+    )
+
+
+@bot.command(name="djrole", help="Set the DJ role for this server: !djrole @Role | off")
+@require_server_admin()
+async def djrole_cmd(ctx, *, arg: str = None):
+    """Server policy: who may use DJ controls when openplay is off."""
+    text = (arg or "").strip().lower()
+    if not text and not ctx.message.role_mentions:
+        rid = guild_setting(ctx.guild.id, "dj_role")
+        if not rid:
+            await ctx.send("🎛️ No DJ role set. Use `!djrole @Role` or `!djrole off`.")
+        else:
+            r = ctx.guild.get_role(int(rid))
+            await ctx.send(f"🎛️ DJ role: {r.mention if r else rid}")
+        return
+    if text in ("off", "none", "clear"):
+        set_guild_setting(ctx.guild.id, "dj_role", None)
+        await ctx.send("🎛️ DJ role cleared.")
+        return
+    role = ctx.message.role_mentions[0] if ctx.message.role_mentions else None
+    if role is None and arg and arg.strip().isdigit():
+        role = ctx.guild.get_role(int(arg.strip()))
+    if role is None:
+        await ctx.send("❌ Usage: `!djrole @Role` or `!djrole off`")
+        return
+    set_guild_setting(ctx.guild.id, "dj_role", role.id)
+    await ctx.send(f"🎛️ DJ role set to {role.mention}. Members with it can use DJ controls.")
+
+
+@bot.command(name="deps", help="Upgrade Python dependencies (staff: manage_runtime)")
+@require_staff("manage_runtime")
 async def deps_cmd(ctx, action: str = None):
     """Run pip install -U -r requirements.txt on the host (same Python as the bot)."""
     if not action or action.lower() not in ("update", "upgrade", "sync"):
         await ctx.send(
             "📦 **Usage:** `!deps update` — runs `pip install --upgrade -r requirements.txt` "
             "for this bot’s Python.\n"
-            "💡 Enable automatic upgrades on startup with env `GONDOR_AUTO_UPDATE_DEPS=1` "
-            "(optional: `GONDOR_AUTO_UPDATE_YTDLP_ONLY=1` for yt-dlp only; "
-            "`GONDOR_SKIP_DEP_UPDATE=1` to skip when auto-update is on)."
+            "💡 Enable automatic upgrades on startup with env `ARKEN_AUTO_UPDATE_DEPS=1` "
+            "(optional: `ARKEN_AUTO_UPDATE_YTDLP_ONLY=1` for yt-dlp only; "
+            "`ARKEN_SKIP_DEP_UPDATE=1` to skip when auto-update is on)."
         )
         return
     await ctx.send("📦 Upgrading dependencies (may take a minute)...")
-    from gondor_deps import upgrade_from_requirements
+    from arken_deps import upgrade_from_requirements
 
     ok = await asyncio.to_thread(upgrade_from_requirements)
     if ok:
@@ -5276,8 +6017,8 @@ async def deps_cmd(ctx, action: str = None):
     else:
         await ctx.send("❌ **Dependency update failed.** Check the machine console for pip output.")
 
-@bot.command(name="reboot", help="Restart the bot")
-@require_authorization()
+@bot.command(name="reboot", help="Restart the bot (staff: manage_runtime)")
+@require_staff("manage_runtime")
 async def reboot_bot(ctx):
     """Restart the bot - authorized users only"""
     
@@ -5363,8 +6104,8 @@ async def reboot_bot(ctx):
         # Force shutdown if graceful fails
         await bot.close()
 
-@bot.command(name="rejoin", help="Rejoin saved voice channels")
-@require_authorization()
+@bot.command(name="rejoin", help="Rejoin saved voice channels (staff: manage_runtime)")
+@require_staff("manage_runtime")
 async def rejoin_cmd(ctx):
     """Manually rejoin saved voice channels"""
     
@@ -5484,14 +6225,16 @@ async def voice_region(ctx):
 # ============================================================================
 # ✨ EXTRAS — audio effects, fade, sleep timer, interactive queue, vote skip, stats + weekly recap,
 #    favourites / history, live lyrics, autoplay radio and a "guess the song" game.
-#    Pure logic lives in gondor_extras.py. Anything needing the network (lyrics, related tracks)
+#    Pure logic lives in arken_extras.py. Anything needing the network (lyrics, related tracks)
 #    goes through the audio processor like every download does: the bot itself never touches the net.
 # ============================================================================
 
-DATA = extras.JsonStore(Path(os.environ.get("GONDOR_DATA_FILE") or _state_file("gondor_data.json", Path(__file__).resolve().parent / "gondor_data.json")))
-AUTOPLAY_MAX = max(1, int(os.environ.get("GONDOR_AUTOPLAY_MAX", "25")))   # songs in a row without a human request
-RECAP_ENABLED = _env_flag("GONDOR_RECAP")             # weekly "what did we listen to" post
-LYRICS_ENABLED = _env_flag("GONDOR_LYRICS")           # master switch for lyric lookups
+DATA = extras.JsonStore(
+    Path(aenv.get("DATA_FILE") or _resolve_state_json("arken_data.json", "gondor_data.json"))
+)
+AUTOPLAY_MAX = max(1, int(aenv.get("AUTOPLAY_MAX", "25")))   # songs in a row without a human request
+RECAP_ENABLED = aenv.flag("RECAP")             # weekly "what did we listen to" post
+LYRICS_ENABLED = aenv.flag("LYRICS")           # master switch for lyric lookups
 GUESS_CLIP_SECONDS = 12
 GUESS_ROUND_SECONDS = 35                               # time to answer, counted from the start of the clip
 SLEEP_FADE_SECONDS = 15
@@ -5988,13 +6731,13 @@ async def like_cmd(ctx):
     if not title or getattr(src, "game", False):
         await ctx.send("❌ Nothing playing to like.")
         return
-    added = extras.add_like(DATA, ctx.author.id, title, getattr(src, "video_id", None))
+    added = extras.add_like(DATA, ctx.guild.id, ctx.author.id, title, getattr(src, "video_id", None))
     await reply_note(ctx, vapor.note("liked", title, "added to your favourites" if added else "already in your favourites"))
 
 
 @bot.command(name="unlike", help="Remove a favourite by its number (see !likes)")
 async def unlike_cmd(ctx, number: int):
-    item = extras.remove_like(DATA, ctx.author.id, number)
+    item = extras.remove_like(DATA, ctx.guild.id, ctx.author.id, number)
     if item is None:
         await ctx.send("❌ No favourite with that number. See `!likes`.")
         return
@@ -6003,18 +6746,19 @@ async def unlike_cmd(ctx, number: int):
 
 @bot.command(name="likes", aliases=["favs", "favorites"], help="Your favourites: !likes | !likes play [shuffle] | !likes remove N")
 async def likes_cmd(ctx, action: str = None, *, rest: str = None):
-    likes = extras.get_likes(DATA, ctx.author.id)
+    # Favourites are per Discord server — same user in another server has a separate list.
+    likes = extras.get_likes(DATA, ctx.guild.id, ctx.author.id)
     act = (action or "").lower()
     if act in ("remove", "rm", "delete"):
         try:
-            item = extras.remove_like(DATA, ctx.author.id, int((rest or "").strip()))
+            item = extras.remove_like(DATA, ctx.guild.id, ctx.author.id, int((rest or "").strip()))
         except ValueError:
             item = None
         await ctx.send("❌ Usage: `!likes remove <number>`" if item is None else f"🗑️ Removed **{item['title']}**")
         return
     if act == "play":
-        if not is_authorized(ctx.author.id):
-            await ctx.send("❌ **Access denied.** Playing your favourites needs authorization.")
+        if not member_can_control(ctx.author):
+            await ctx.send("❌ **Access denied.** Playing favourites needs DJ / admin / openplay.")
             return
         if not likes:
             await ctx.send("❌ You have no favourites yet. Use `!like` while a song plays.")
@@ -6171,7 +6915,7 @@ async def lyrics_cmd(ctx, mode: str = None):
         await ctx.send("❌ **Access denied.** Turning live lyrics on or off needs authorization (`!lyrics full` is open).")
         return
     if not LYRICS_ENABLED:
-        await ctx.send("❌ Lyrics are disabled (GONDOR_LYRICS=0).")
+        await ctx.send("❌ Lyrics are disabled (ARKEN_LYRICS=0).")
         return
     on = (not lyrics_enabled(gid)) if mode in ("", "toggle") else mode in ("on", "1", "yes", "true")
     set_guild_setting(gid, "lyrics", on)
@@ -6371,7 +7115,7 @@ async def _run_game(game):
 
 
 def guess_pool(guild_id):
-    """Songs this server has played plus everyone's favourites."""
+    """Songs this server has played plus favourites saved in THIS server only."""
     seen, pool = set(), []
 
     def add(title, vid):
@@ -6384,9 +7128,8 @@ def guess_pool(guild_id):
     with DATA.lock:
         for p in DATA.guild(guild_id).get("plays", []):
             add(p.get("title"), p.get("vid"))
-        for user in DATA.data.get("users", {}).values():
-            for like in user.get("likes", []):
-                add(like.get("title"), like.get("vid"))
+        for like in tenancy.guild_likes_pool(DATA.data, guild_id):
+            add(like.get("title"), like.get("vid"))
     return pool
 
 
@@ -6451,11 +7194,11 @@ async def guess_cmd(ctx, *args):
 #    and show this week's stats.
 # ============================================================================
 
-DASHBOARD_ON_SUMMON = _env_flag("GONDOR_DASHBOARD")      # post the dashboard automatically after !summon
+DASHBOARD_ON_SUMMON = aenv.flag("DASHBOARD")      # post the dashboard automatically after !summon
 SESSION_MAX_AGE = 14 * 86400                              # a saved session older than this is ignored
 SESSION_SAVE_EVERY = 30                                   # seconds between disk writes while nothing changes
-FAV_PLAYLIST_URL = "https://www.youtube.com/playlist?list=gondor-favourites"      # placeholders: the entries are
-SESSION_PLAYLIST_URL = "https://www.youtube.com/playlist?list=gondor-last-session"  # supplied, nothing is fetched
+FAV_PLAYLIST_URL = "https://www.youtube.com/playlist?list=arken-favourites"      # placeholders: the entries are
+SESSION_PLAYLIST_URL = "https://www.youtube.com/playlist?list=arken-last-session"  # supplied, nothing is fetched
 
 _session_saved_at = {}
 _session_dirty = set()
@@ -6752,7 +7495,7 @@ class DashboardView(discord.ui.View):
     async def _play_favs(self, interaction, shuffle):
         if not await self._guard(interaction):
             return
-        likes = extras.get_likes(DATA, interaction.user.id)
+        likes = extras.get_likes(DATA, self.guild_id, interaction.user.id)
         if not likes:
             return await self._say(interaction, "You have no favourites yet. Use `!like` while a song plays.")
         await interaction.response.defer()
@@ -6885,9 +7628,33 @@ if __name__ == "__main__":
         print("💡 Set NEW_DISCORD_TOKEN in .env file")
         exit(1)
     
-    from gondor_deps import maybe_auto_update_dependencies
+    from arken_deps import maybe_auto_update_dependencies
 
     maybe_auto_update_dependencies()
+
+    # Multi-server foundation: move legacy global likes/playlists into the home guild once.
+    # Safe to run every boot (idempotent). Set ARKEN_HOME_GUILD if more than one guild already
+    # has settings/history and migration would be ambiguous.
+    try:
+        with DATA.lock:
+            report = tenancy.run_data_migration(
+                DATA.data,
+                settings=_settings,
+                playlists_root=str(PLAYLIST_DIR),
+                home_guild_env=aenv.get("HOME_GUILD"),
+            )
+            if report.get("likes_moved"):
+                DATA.save()
+                print(f"🛡️ Tenancy: moved {report['likes_moved']} favourite(s) into guild {report['home_guild']}")
+            pl = report.get("playlists") or {}
+            if pl.get("moved"):
+                print(f"🛡️ Tenancy: moved {pl['moved']} playlist item(s) into guild {report['home_guild']}")
+            if pl.get("conflicts"):
+                print(f"⚠️ Tenancy: playlist name conflicts left in place: {pl['conflicts']}")
+            if report.get("skipped"):
+                print("⚠️ Tenancy: set ARKEN_HOME_GUILD to finish migrating global likes")
+    except Exception as e:
+        print(f"⚠️ Tenancy migration skipped: {e}")
 
     print("🚀 Starting Discord Audio Bot...")
     print("🎵 Initializing streaming services...")

@@ -1,6 +1,8 @@
-# Discord Music Bot (Python)
+# Arken — Discord music bot (Python)
 
-A reliable Discord music bot that plays music from YouTube using the power of Python, `yt-dlp`, and `discord.py`.
+**Arken** is a reliable Discord music fleet bot that plays from YouTube using Python, `yt-dlp`, and `discord.py`. (Separate from **Obselis**, the archive site on the same VPS.)
+
+`ARKEN_*` environment variables configure the bot; legacy `GONDOR_*` names still work.
 
 ## 🎵 Features
 
@@ -47,7 +49,7 @@ A reliable Discord music bot that plays music from YouTube using the power of Py
 On the server:
 
 ```bash
-git clone https://github.com/Brocrad/Gondor.git && cd Gondor
+git clone https://github.com/Brocrad/Arken.git && cd Arken
 cp .env.example .env && nano .env                # set NEW_DISCORD_TOKEN
 docker compose build
 ```
@@ -55,7 +57,7 @@ docker compose build
 Then, **from the PC that has your current data**, push the state to the server (needs `ssh`/`scp`, key auth recommended):
 
 ```bash
-python deploy/sync_state.py user@your-server                  # add --remote-dir /path/to/Gondor, -p PORT, -i KEYFILE
+python deploy/sync_state.py user@your-server                  # add --remote-dir /path/to/Arken, -p PORT, -i KEYFILE
 ```
 
 It bundles your whitelist, likes/history/stats, per-server settings, playlists **and their stored audio files**,
@@ -71,9 +73,20 @@ docker compose logs -f                                         # on the server
 
 - State lives in `./data` (likes/history/stats, per-server settings, whitelist, saved session, playlists). Back that folder up.
 - Stop your local bot first: two bots on one token cause voice 4006 loops.
-- If your server user isn't uid/gid 1000, set `GONDOR_UID` / `GONDOR_GID` in `.env` (see `id`) before building.
+- If your server user isn't uid/gid 1000, set `ARKEN_UID` / `ARKEN_GID` in `.env` (see `id`) before building.
 - `!reboot` works (the container restarts itself). To update the code or yt-dlp: `git pull && docker compose up -d --build`. `!deps update` only lasts until the container is recreated.
 - Downloaded audio is a temporary cache inside the container and is not persisted.
+
+### Multi-token pool (optional)
+
+To spread guilds across several Discord bot applications (rate-limit / CPU headroom):
+
+1. Create the bot apps in the Discord developer portal (tokens are not minted by Arken).
+2. Set `ARKEN_TOKEN_POOL=gondor,osgiliath,nimloth,morthond` and `ARKEN_MAX_GUILDS_PER_TOKEN=5` in `.env`.
+3. Run one process/container per **city-token** with `ARKEN_TOKEN_ID` + that bot’s `NEW_DISCORD_TOKEN` (see `docker-compose.pool.yml`).
+4. `!allowguild` auto-assigns the least-loaded token **and** the next free callsign seat (e.g. **Osgiliath · East Bank**). Sticky until `!leaveguild`. Use `!tokens` / `!guilds` to inspect.
+
+Playlists/likes/settings stay isolated by Discord guild id — seats are support labels only. Prometheus textfiles land in `data/metrics/` (`ARKEN_METRICS=0` disables).
 
 ## 🎮 Commands
 
@@ -102,13 +115,13 @@ All commands use the `!` prefix:
 - `!autoplay [on|off]` - When the queue runs out, keep playing similar songs (stops after 25 in a row, or if nobody is listening)
 - `!guess [rounds] [playlist url]` / `!guess stop` / `!guess skip` - Guess-the-song game from songs the server has played and everyone's favourites
 - `!stats [day|week|month|all]`, `!stats recap on|off` - Listening stats; a weekly recap is posted automatically
-- `!dashboard` (also `!menu`, `!home`) - Home panel, posted automatically when Gondor is summoned: **Resume last session**, favourites (+ shuffle), start radio from the last song, a **Quick play** pop-up, stats, a recently-played dropdown, an effect dropdown and autoplay / lyrics / fade toggles. Anyone can open it and view stats; the action buttons need authorization
+- `!dashboard` (also `!menu`, `!home`) - Home panel, posted automatically when Arken is summoned: **Resume last session**, favourites (+ shuffle), start radio from the last song, a **Quick play** pop-up, stats, a recently-played dropdown, an effect dropdown and autoplay / lyrics / fade toggles. Anyone can open it and view stats; the action buttons need authorization
 
 The now-playing frame also shows who requested the song and the active effect. Bot-side network access stays
 zero: lyrics and "similar songs" lookups are done by the audio processor (restart it after updating).
 Error messages, `!kill` and a finished playlist show short terminal-style GIFs.
 
-**Session memory:** about every 10 seconds (and on `!stop` / `!kill`) Gondor saves what is playing, the queue, the rest of a YouTube playlist and the position, as song *references* (tracks are deleted after playing, so they are downloaded again on resume). **Resume last session** re-queues them; the interrupted song restarts and jumps back to the saved spot if it was 20+ seconds in. A session that ends naturally is cleared; sessions older than 14 days are ignored.
+**Session memory:** about every 10 seconds (and on `!stop` / `!kill`) Arken saves what is playing, the queue, the rest of a YouTube playlist and the position, as song *references* (tracks are deleted after playing, so they are downloaded again on resume). **Resume last session** re-queues them; the interrupted song restarts and jumps back to the saved spot if it was 20+ seconds in. A session that ends naturally is cleared; sessions older than 14 days are ignored.
 
 The "now playing" message also has buttons (⏪ 10s, pause/resume, skip, stop, ⏩ 10s, volume −/+), a 🎯 **Jump to…**
 pop-up where you type an exact time (`1:30`, `90`, `+30`, `-15`), and a **scrub dropdown** with numbered jump points
@@ -117,14 +130,16 @@ Its equalizer bar reacts to the real audio, and shows a live "ends in …" count
 profile shows "Listening to <song>".
 
 ### ⚙️ Optional environment toggles (set in `.env`, `0` turns a feature off):
-`GONDOR_GIFS` (animated badges), `GONDOR_DONUT` (summon donut), `GONDOR_NP_LIVE` (live progress),
-`GONDOR_NP_REACTIVE` (bars follow the audio), `GONDOR_NP_COUNTDOWN` (ends-in line), `GONDOR_NP_BUTTONS` (buttons),
-`GONDOR_PRESENCE` (profile status), `GONDOR_COVERS` (pixel-art thumbnail, fetched by the audio processor),
-`GONDOR_NOTE_SECONDS` (how long short replies stay, default 12; `0` keeps them),
-`GONDOR_FFMPEG` (full path to ffmpeg if it isn't on your PATH), `GONDOR_LYRICS` (lyric lookups),
-`GONDOR_RECAP` (weekly recap post), `GONDOR_CRASH_GIF` (terminal crash GIF on errors),
-`GONDOR_AUTOPLAY_MAX` (songs in a row autoplay may queue, default 25), `GONDOR_DASHBOARD` (post the dashboard on summon; `!dashboard` always works).
-Your favourites, history, stats and saved session live in `gondor_data.json` (not committed).
+`ARKEN_GIFS` (animated badges and terminal scenes branded per server: seat title, `callsign@city` prompt, and `!style` colours), `ARKEN_DONUT` (summon donut), `ARKEN_NP_LIVE` (live progress),
+`ARKEN_NP_REACTIVE` (bars follow the audio), `ARKEN_NP_COUNTDOWN` (ends-in line), `ARKEN_NP_BUTTONS` (buttons),
+`ARKEN_PRESENCE` (profile status), `ARKEN_COVERS` (pixel-art thumbnail, fetched by the audio processor),
+`ARKEN_NOTE_SECONDS` (how long short replies stay, default 12; `0` keeps them),
+`ARKEN_FFMPEG` (full path to ffmpeg if it isn't on your PATH), `ARKEN_LYRICS` (lyric lookups),
+`ARKEN_RECAP` (weekly recap post), `ARKEN_CRASH_GIF` (terminal crash GIF on errors),
+`ARKEN_AUTOPLAY_MAX` (songs in a row autoplay may queue, default 25), `ARKEN_DASHBOARD` (post the dashboard on summon; `!dashboard` always works).
+Your favourites, history, stats and saved session live in `arken_data.json` (not committed; legacy `gondor_data.json` is still read if present).
+
+**Naming:** the program is **Arken**. **Gondor** (and `gondor`) appear only for the city **token** and support seats (e.g. **Gondor · Citadel**), not the product.
 
 ### 🔧 Control Commands:
 - `!summon` - Summon the bot to your voice channel

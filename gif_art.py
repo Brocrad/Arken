@@ -1,5 +1,5 @@
 """
-Animated GIF art for Gondor: status badges ("NOW PLAYING", "DOWNLOADING", ...), cover-art headers and
+Animated GIF art for Arken: status badges ("NOW PLAYING", "DOWNLOADING", ...), cover-art headers and
 the ANSI-terminal summon donut.
 
 Discord animates GIF attachments natively, so unlike edited text they are smooth and cost no
@@ -9,9 +9,10 @@ pixel font - so there is nothing extra to install (no Pillow, no font files).
 Public API (all thread-safe; results cached in memory and, where it makes sense, in ./gif_cache):
     badge_bytes(label, style)            animated badge for a status label, e.g. "now playing"
     header_bytes(label, style, cover)    the badge with a pixel-art cover on its left (LRU cached)
-    donut_bytes(style)                   spinning donut in an ANSI terminal window
+    donut_bytes(style, theme)            spinning donut in an ANSI terminal window (per-guild chrome)
     cover_from_rgb(data, w, h, key)      raw rgb24 -> Cover (None if the data is unusable)
-    terminal_bytes(kind, style, text)    ANSI terminal scenes: "shutdown", "crash", "rain"
+    terminal_bytes(kind, style, text, theme)  ANSI terminal scenes: "shutdown", "crash", "rain"
+    GuildTheme                           seat / guild branding for terminal GIFs (colours still use !style)
     adaptive_style(cover)                a colour style derived from a cover's dominant colours
     prewarm()                            generate the default-style set (run in a background thread)
 Styles ("vaporwave", "matrix", "sunset", "synthwave") only change colours; "auto" follows the cover.
@@ -21,8 +22,10 @@ import colorsys
 import hashlib
 import math
 import random
+import re
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -145,6 +148,74 @@ STYLES = {
     ),
 }
 DEFAULT_STYLE = "vaporwave"
+
+
+def _ascii_host(part: str) -> str:
+    """Lowercase host/callsign token safe for the pixel terminal font."""
+    part = str(part).strip().lower()
+    out: list[str] = []
+    for ch in part:
+        if ch.isalnum() or ch in "-_":
+            out.append(ch)
+        elif ch in " '\u00b7" and out and out[-1] != "-":
+            out.append("-")
+    return re.sub(r"-+", "-", "".join(out)).strip("-") or "arken"
+
+
+def _clip_title(title: str, max_chars: int = 44) -> str:
+    title = " ".join(str(title).split())
+    if len(title) <= max_chars:
+        return title
+    return title[: max_chars - 1].rstrip() + "…"
+
+
+@dataclass(frozen=True, slots=True)
+class GuildTheme:
+    """Terminal window branding: city seat on a token, or a guild slug when unassigned."""
+
+    title: str
+    prompt: str
+    summon: str
+
+    @classmethod
+    def default(cls) -> "GuildTheme":
+        return cls("Arken: ~", "arken@discord", "arken")
+
+    @classmethod
+    def from_seat(cls, seat: str | None, callsign: str, token_id: str) -> "GuildTheme":
+        cs = _ascii_host(callsign)
+        tid = _ascii_host(token_id)
+        prompt = f"{cs}@{tid}"[:22]
+        summon = cs.replace("-", " ")[:18]
+        seat = (seat or "").strip()
+        title = _clip_title(f"{seat}: ~" if seat else f"{tid}: ~")
+        return cls(title, prompt, summon)
+
+    @classmethod
+    def from_guild_name(cls, name: str) -> "GuildTheme":
+        slug = _ascii_host(name)[:14] or "guild"
+        prompt = f"{slug}@guild"[:22]
+        title = _clip_title(f"{name.strip()}: ~", 40)
+        return cls(title, prompt, slug)
+
+    def cache_key(self) -> str:
+        return slug(self.prompt) or "arken"
+
+    def term_title(self, suffix: str = "") -> str:
+        base = self.title.removesuffix(": ~").rstrip()
+        if suffix:
+            return _clip_title(f"{base}: ~ {suffix}")
+        return self.title if self.title.endswith(": ~") else _clip_title(f"{base}: ~")
+
+    def badge_brand(self) -> str:
+        """Seat / guild line on status badge GIFs."""
+        base = self.title.removesuffix(": ~").strip()
+        if base:
+            safe = "".join(ch if ch.isascii() and (ch.isalnum() or ch in " -_") else " " for ch in base)
+            line = " ".join(safe.split()).upper()
+            if line:
+                return line[:24]
+        return self.summon.upper()[:24]
 
 
 def style_names():
@@ -453,6 +524,7 @@ def effective_style(pref, cover=None):
 
 BADGE_FRAMES = 16
 BADGE_DELAY = 7  # centiseconds
+BADGE_BRAND_H = 10  # top strip for per-guild seat branding
 LABELS = (
     "searching", "reading playlist", "queued", "extracting", "downloading", "finishing",
     "buffering", "now playing", "paused", "played", "stopped", "importing", "buffer ready", "error",
@@ -462,20 +534,26 @@ LABELS = (
 )
 
 
-def _render_badge(label, style=DEFAULT_STYLE, cover=None):
+def _render_badge(label, style=DEFAULT_STYLE, cover=None, theme: GuildTheme | None = None):
     style = resolve_style(style)
+    theme = theme or GuildTheme.default()
+    brand = theme.badge_brand()
+    prompt = theme.prompt
     text = label.upper()
     cells = _text_pixels(text)
     scale = 3
     adv = 6 * scale
     cov_w, cov_h = COVER_W * COVER_SCALE, COVER_H * COVER_SCALE
-    height = 62 if cover else 40
+    body_h = 62 if cover else 40
+    height = body_h + BADGE_BRAND_H
     ox = (6 + cov_w + 8) if cover else 0           # everything else shifts right of the cover
     bar_x0 = ox + 10
     text_x = bar_x0 + 5 * 6 + 12
     width = text_x + len(text) * adv - scale + 14
-    text_y = (height - 7 * scale) // 2
-    base = (height + 24) // 2                        # equalizer baseline
+    brand_w = max(len(brand) * 6, len(prompt) * 6) + 16
+    width = max(width, brand_w)
+    text_y = BADGE_BRAND_H + (body_h - 7 * scale) // 2
+    base = BADGE_BRAND_H + (body_h + 24) // 2        # equalizer baseline
     rng = random.Random(label)
     phases = [rng.random() * 6.2832 for _ in range(5)]
     glitches = {5: (3, 13, 3), 11: (9, 21, -3), 12: (5, 11, 2)}  # frame -> (band rows from text top, dx)
@@ -488,9 +566,14 @@ def _render_badge(label, style=DEFAULT_STYLE, cover=None):
         cv.marquee(shift)
         cv.rect(0, 1, 1, height - 1, IDX_DIM)
         cv.rect(width - 1, 1, width, height - 1, IDX_DIM)
+        cv.rect(0, BADGE_BRAND_H - 1, width, BADGE_BRAND_H, IDX_DIM)
+        cv.text(brand, 6, 2, 1, GRAD0 + (shift + 2) % GRAD_N, keep_case=True)
+        if prompt:
+            pw = len(prompt) * 6
+            cv.text(prompt, max(6, width - pw - 6), 2, 1, IDX_DIM, keep_case=True)
 
         if cover:
-            top = (height - cov_h) // 2
+            top = BADGE_BRAND_H + (body_h - cov_h) // 2
             band_c = int(f / BADGE_FRAMES * (cov_h + 16)) - 8     # shimmer band sweeping down
             glitch = glitches.get(f)
             for y in range(cov_h):
@@ -553,9 +636,10 @@ CHROME_H = 20
 _LUMINANCE = ".,-~:;=!*#$@"   # same shading characters as the classic donut.c
 
 
-def _render_donut(style=DEFAULT_STYLE):
+def _render_donut(style=DEFAULT_STYLE, theme: GuildTheme | None = None):
     import donut  # local import: only needed when generating
 
+    theme = theme or GuildTheme.default()
     st = STYLES[style if style in STYLES else DEFAULT_STYLE]  # the terminal donut only uses the preset styles
     ramp = st["ansi_ramp"]
     cols, rows, cw, ch, sc = DONUT_COLS, DONUT_ROWS, DONUT_CELL_W, DONUT_CELL_H, DONUT_SCALE
@@ -581,19 +665,19 @@ def _render_donut(style=DEFAULT_STYLE):
             cx, cy = 14 + i * 16, CHROME_H // 2
             cv.rect(cx - 3, cy - 2, cx + 4, cy + 3, colr)
             cv.rect(cx - 2, cy - 3, cx + 3, cy + 4, colr)
-        title = "gondor@discord: ~"
+        title = theme.title
         cv.text(title, (width - len(title) * 6) // 2, (CHROME_H - 7) // 2, 1, 7)
         top = CHROME_H
+        prompt_user = theme.prompt
 
         def put(col, row, text, color):
             for i, lit in enumerate(_text_pixels(text, True)):
                 cv.glyph(lit, (col + i) * cw + gx, top + row * ch + gy, sc, color)
 
-        # prompt line:  gondor@discord:~$ ./donut
-        put(0, 0, "gondor@discord", st["prompt"])
-        put(14, 0, ":", 15)
-        put(15, 0, "~", 12)
-        put(16, 0, "$ ./donut", 15)
+        put(0, 0, prompt_user, st["prompt"])
+        put(len(prompt_user), 0, ":", 15)
+        put(len(prompt_user) + 1, 0, "~", 12)
+        put(len(prompt_user) + 2, 0, "$ ./donut", 15)
         # the donut: one ANSI-coloured character per cell
         for i, lv in enumerate(levels):
             if lv < 0:
@@ -602,7 +686,7 @@ def _render_donut(style=DEFAULT_STYLE):
             cv.glyph(glyphs[lv], col * cw + gx, top + (row + 1) * ch + gy, sc, ramp[lv])
         # status line: spinner, text with cycling dots, blinking cursor
         dots = "." * (1 + (f // 4) % 3)
-        line = f"{spinner[(f // 3) % 4]} summoning gondor{dots}"
+        line = f"{spinner[(f // 3) % 4]} summoning {theme.summon}{dots}"
         put(0, rows + 1, line[0], st["accent"])
         put(2, rows + 1, line[2:], 7)
         if (f // 6) % 2 == 0:
@@ -615,7 +699,7 @@ def _render_donut(style=DEFAULT_STYLE):
 # Terminal scenes: shutdown (!kill), crash (a failed request), rain (standing by)
 # ---------------------------------------------------------------------------
 
-def _term_scene(style, rows, nframes, delay, draw, title="gondor@discord: ~"):
+def _term_scene(style, rows, nframes, delay, draw, title: str):
     """Render an ANSI terminal window; draw(frame, put, cv, style_dict) paints each frame's text."""
     st = STYLES[style if style in STYLES else DEFAULT_STYLE]
     cols, cw, ch, sc = DONUT_COLS, DONUT_CELL_W, DONUT_CELL_H, DONUT_SCALE
@@ -654,11 +738,12 @@ def _segments(put, row, segments, visible=None, col=0):
     return col
 
 
-def _prompt(st, command):
-    return [("gondor@discord", st["prompt"]), (":", 15), ("~", 12), ("$ " + command, 15)]
+def _prompt(st, command, theme: GuildTheme):
+    return [(theme.prompt, st["prompt"]), (":", 15), ("~", 12), ("$ " + command, 15)]
 
 
-def _render_shutdown(style=DEFAULT_STYLE):
+def _render_shutdown(style=DEFAULT_STYLE, theme: GuildTheme | None = None):
+    theme = theme or GuildTheme.default()
     steps = [  # (first frame, characters per frame, segments)
         (0, 2, None),
         (14, 99, [("[ ", 7), ("ok", 10), (" ] stopping playback", 7)]),
@@ -673,7 +758,7 @@ def _render_shutdown(style=DEFAULT_STYLE):
             if f < start:
                 break
             if seg is None:
-                seg = _prompt(st, "shutdown")
+                seg = _prompt(st, "shutdown", theme)
             elif isinstance(seg, str):
                 seg = [(seg, st["accent"])]
             col = _segments(put, row, seg, (f - start + 1) * speed)
@@ -681,7 +766,7 @@ def _render_shutdown(style=DEFAULT_STYLE):
         if (f // 3) % 2 == 0:
             put(last_col + 1, last_row, "\u2588", 15)
 
-    return _term_scene(style, 8, 44, 8, draw)
+    return _term_scene(style, 8, 44, 8, draw, title=theme.title)
 
 
 def _ascii_line(text, width=30, lines=3):
@@ -692,18 +777,21 @@ def _ascii_line(text, width=30, lines=3):
     return out or ["unknown error"]
 
 
-def _render_crash(style=DEFAULT_STYLE, text="something went wrong"):
+def _render_crash(style=DEFAULT_STYLE, text="something went wrong", theme: GuildTheme | None = None):
+    theme = theme or GuildTheme.default()
     msg = _ascii_line(text)
     rng = random.Random(hash(text) & 0xFFFF)
     noise = "#@%*$=+<>/|"
     plan = [(rng.random() < 0.45, rng.randrange(1, 7), rng.randrange(0, 20), rng.randrange(6, 14)) for _ in range(16)]
 
+    prompt_user = theme.prompt
+
     def draw(f, put, cv, st):
         glitch, row, col, n = plan[f]
-        put(0, 0, "gondor@discord", st["prompt"])
-        put(14, 0, ":", 15)
-        put(15, 0, "~", 12)
-        put(16, 0, "$ ./play", 15)
+        put(0, 0, prompt_user, st["prompt"])
+        put(len(prompt_user), 0, ":", 15)
+        put(len(prompt_user) + 1, 0, "~", 12)
+        put(len(prompt_user) + 2, 0, "$ ./play", 15)
         put(0, 1, "fatal error", 9 if f % 4 < 3 else 15)
         for i, line in enumerate(msg):
             put(0, 2 + i, line, 11)
@@ -712,10 +800,11 @@ def _render_crash(style=DEFAULT_STYLE, text="something went wrong"):
         if glitch:
             put(col, row, "".join(rng.choice(noise) for _ in range(n)), 9 if f % 2 else 12)
 
-    return _term_scene(style, 8, 16, 7, draw, title="gondor@discord: ~ [crashed]")
+    return _term_scene(style, 8, 16, 7, draw, title=theme.term_title("[crashed]"))
 
 
-def _render_rain(style=DEFAULT_STYLE):
+def _render_rain(style=DEFAULT_STYLE, theme: GuildTheme | None = None):
+    theme = theme or GuildTheme.default()
     rows, cols = 12, DONUT_COLS
     trail, cycle = 8, 12 + 8 + 4
     rng0 = random.Random(7)
@@ -736,28 +825,30 @@ def _render_rain(style=DEFAULT_STYLE):
         if (f // 4) % 2 == 0:
             put(12, rows, "\u2588", 15)
 
-    return _term_scene(style, rows + 1, cycle, 9, draw, title="gondor@discord: ~ [idle]")
+    return _term_scene(style, rows + 1, cycle, 9, draw, title=theme.term_title("[idle]"))
 
 
 _TERM_KINDS = {"shutdown": _render_shutdown, "crash": _render_crash, "rain": _render_rain}
 
 
-def terminal_bytes(kind, style=None, text=None):
+def terminal_bytes(kind, style=None, text=None, theme: GuildTheme | None = None):
     """GIF of a terminal scene. 'crash' takes the (short) error text and is kept in the small LRU."""
     style = style if style in STYLES else DEFAULT_STYLE
+    theme = theme or GuildTheme.default()
+    tkey = theme.cache_key()
     if kind == "crash":
-        key = ("term", kind, style, text)
+        key = ("term", kind, style, text, tkey)
         with _lock:
             if key in _header_lru:
                 _header_lru.move_to_end(key)
                 return _header_lru[key]
-        data = _render_crash(style, text or "something went wrong")
+        data = _render_crash(style, text or "something went wrong", theme)
         with _lock:
             _header_lru[key] = data
             while len(_header_lru) > HEADER_LRU_SIZE:
                 _header_lru.popitem(last=False)
         return data
-    return _cached(f"term_{kind}__{style}", lambda: _TERM_KINDS[kind](style))
+    return _cached(f"term_{kind}__{style}__{tkey}", lambda: _TERM_KINDS[kind](style, theme))
 
 
 # ---------------------------------------------------------------------------
@@ -817,22 +908,26 @@ def slug(label):
     return "".join(ch if ch.isalnum() else "_" for ch in label.lower()).strip("_") or "badge"
 
 
-def badge_bytes(label, style=None):
+def badge_bytes(label, style=None, theme: GuildTheme | None = None):
     style = resolve_style(style)
-    return _cached(f"badge_{slug(label)}__{style}", lambda: _render_badge(label, style))
+    theme = theme or GuildTheme.default()
+    tkey = theme.cache_key()
+    return _cached(f"badge_{slug(label)}__{style}__{tkey}", lambda: _render_badge(label, style, None, theme))
 
 
-def header_bytes(label, style=None, cover=None):
+def header_bytes(label, style=None, cover=None, theme: GuildTheme | None = None):
     """Badge GIF; with a Cover it gets the pixel-art cover on its left (memory-cached per track)."""
     style = resolve_style(style)
+    theme = theme or GuildTheme.default()
+    tkey = theme.cache_key()
     if cover is None:
-        return badge_bytes(label, style)
-    key = (slug(label), style, cover.key)
+        return badge_bytes(label, style, theme)
+    key = (slug(label), style, cover.key, tkey)
     with _lock:
         if key in _header_lru:
             _header_lru.move_to_end(key)
             return _header_lru[key]
-    data = _render_badge(label, style, cover)
+    data = _render_badge(label, style, cover, theme)
     with _lock:
         _header_lru[key] = data
         while len(_header_lru) > HEADER_LRU_SIZE:
@@ -840,9 +935,10 @@ def header_bytes(label, style=None, cover=None):
     return data
 
 
-def donut_bytes(style=None):
+def donut_bytes(style=None, theme: GuildTheme | None = None):
     style = resolve_style(style)
-    return _cached(f"donut__{style}", lambda: _render_donut(style))
+    theme = theme or GuildTheme.default()
+    return _cached(f"donut__{style}__{theme.cache_key()}", lambda: _render_donut(style, theme))
 
 
 def prewarm(style=DEFAULT_STYLE):
