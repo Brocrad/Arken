@@ -29,6 +29,8 @@ import threading
 import time
 from pathlib import Path
 
+import arken_io
+
 # Discord snowflakes are 17–20 digits today; 15+ digits = guild folder, so a legacy playlist named
 # "2024" is not mistaken for one.
 _GUILD_DIR_RE = re.compile(r"^\d{15,25}$")
@@ -492,6 +494,7 @@ class TokenPool:
         self.weight_members = float(weight_members)
         self.assignments: dict[str, dict] = {}  # guild_id -> meta
         self.runtime: dict[str, dict] = {}  # token_id -> {active_players, updated}
+        self._removed_guilds: set[str] = set()  # pending deletes for cross-container merge
         self.load()
         if token_ids:
             self.set_tokens(token_ids)
@@ -527,19 +530,39 @@ class TokenPool:
 
     def save(self) -> None:
         with self.lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "version": 1,
-                "tokens": list(self.token_ids),
-                "max_guilds_per_token": self.max_guilds_per_token,
-                "assignments": {k: self.assignments[k] for k in sorted(self.assignments, key=int)},
-                "runtime": self.runtime,
-                "updated": time.time(),
-            }
-            tmp = self.path.with_name("." + self.path.name + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, self.path)
+            local_asg = {k: dict(v) for k, v in self.assignments.items()}
+            local_rt = {k: dict(v) for k, v in self.runtime.items()}
+            token_ids = list(self.token_ids)
+            cap = self.max_guilds_per_token
+
+            removals = set(self._removed_guilds)
+
+            def patch(current: dict) -> dict:
+                disk_asg = current.get("assignments")
+                if not isinstance(disk_asg, dict):
+                    disk_asg = {}
+                merged_asg = {**disk_asg, **local_asg}
+                for gid in removals:
+                    merged_asg.pop(gid, None)
+                disk_rt = current.get("runtime")
+                if not isinstance(disk_rt, dict):
+                    disk_rt = {}
+                merged_rt = {**disk_rt, **local_rt}
+                return {
+                    "version": current.get("version", 1),
+                    "tokens": token_ids or current.get("tokens") or [],
+                    "max_guilds_per_token": cap,
+                    "assignments": {
+                        k: merged_asg[k] for k in sorted(merged_asg, key=int)
+                    },
+                    "runtime": merged_rt,
+                    "updated": time.time(),
+                }
+
+            arken_io.merge_json_file(self.path, patch)
+            self._removed_guilds.clear()
+            # Pick up assignments written by other containers in the pool.
+            self.load()
 
     def enabled(self) -> bool:
         return len(self.token_ids) > 0
@@ -765,6 +788,7 @@ class TokenPool:
             if key not in self.assignments:
                 return False
             del self.assignments[key]
+            self._removed_guilds.add(key)
             self.save()
             return True
 

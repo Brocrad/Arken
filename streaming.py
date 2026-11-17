@@ -47,8 +47,10 @@ from array import array
 from collections import deque, OrderedDict
 from types import SimpleNamespace
 
+import arken_audio
 import arken_env as aenv
 import arken_extras as extras  # effects, sleep timer, stats, likes, lyrics, game helpers (pure logic)
+import arken_policy
 import arken_tenancy as tenancy  # multi-server isolation foundation (guild-scoped personalization)
 import arken_metrics as metrics  # Prometheus textfile snapshots for Grafana later
 try:
@@ -101,12 +103,6 @@ def get_ffmpeg_path():
         found = _LEGACY_FFMPEG
     _ffmpeg_cached = found or "ffmpeg"
     return _ffmpeg_cached
-
-# FFmpeg options for audio playback - Optimized for Discord and AAC files
-ffmpeg_options = {
-    'before_options': '',
-    'options': '-vn -f s16le -ar 48000 -ac 2 -acodec pcm_s16le -loglevel warning'
-}
 
 # Bot setup - completely generic
 # Enable ALL necessary intents explicitly
@@ -671,66 +667,62 @@ async def rejoin_voice_channels():
         print("📢 No voice channels were rejoined")
 
 def save_playback_state():
-    """Save current playback state and queues"""
+    """Save current playback state and queues (merge into shared file for multi-container pool)."""
     try:
-        playback_state = {}
-        
-        for guild in bot.guilds:
-            guild_id = guild.id
-            
-            # Check if bot is in voice channel and something is playing
-            if guild.voice_client and (guild.voice_client.is_playing() or guild.voice_client.is_paused()):
+        import arken_io
+
+        saved_count = 0
+
+        def patch(existing: dict) -> dict:
+            nonlocal saved_count
+            playback_state = dict(existing) if isinstance(existing, dict) else {}
+
+            for guild in bot.guilds:
+                guild_id = guild.id
+                if not guild_served_here(guild_id):
+                    continue
+                vc = guild.voice_client
+                if not vc or not (vc.is_playing() or vc.is_paused()):
+                    continue
                 current_source = current_sources.get(guild_id)
-                
-                if current_source and hasattr(current_source, 'title'):
-                    guild_state = {
-                        'voice_channel_id': guild.voice_client.channel.id,
-                        'voice_channel_name': guild.voice_client.channel.name,
-                        'guild_name': guild.name,
-                        'current_song': {
-                            'title': current_source.title,
-                            'file_path': current_source.file_path,
-                            'duration': current_source.duration
-                        },
-                        'was_playing': guild.voice_client.is_playing(),
-                        'was_paused': guild.voice_client.is_paused(),
-                        'saved_time': time.time()
-                    }
-                    
-                    # Save song queue if it exists
-                    if guild_id in song_queues and song_queues[guild_id]:
-                        guild_state['song_queue'] = []
-                        for song in song_queues[guild_id]:
-                            # Convert User object to ID for JSON serialization
-                            song_data = song.copy()
-                            if hasattr(song_data.get('requested_by'), 'id'):
-                                song_data['requested_by_id'] = song_data['requested_by'].id
-                                song_data['requested_by_name'] = song_data['requested_by'].name
-                                del song_data['requested_by']
-                            guild_state['song_queue'].append(song_data)
-                    
-                    # Save playlist state if active
-                    if guild_id in playlist_queues:
-                        playlist_state = playlist_queues[guild_id].copy()
-                        # Convert any non-serializable objects
-                        guild_state['playlist_state'] = playlist_state
-                    
-                    # Save notification channel
-                    if guild_id in notification_channels:
-                        guild_state['notification_channel_id'] = notification_channels[guild_id].id
-                    
-                    playback_state[str(guild_id)] = guild_state
-        
-        if playback_state:
-            with open(PLAYBACK_STATE_FILE, 'w') as f:
-                json.dump(playback_state, f, indent=2)
-            
-            print(f"💾 Saved playback state for {len(playback_state)} guilds")
+                if not current_source or not hasattr(current_source, "title"):
+                    continue
+                guild_state = {
+                    "voice_channel_id": vc.channel.id,
+                    "voice_channel_name": vc.channel.name,
+                    "guild_name": guild.name,
+                    "current_song": {
+                        "title": current_source.title,
+                        "file_path": current_source.file_path,
+                        "duration": current_source.duration,
+                    },
+                    "was_playing": vc.is_playing(),
+                    "was_paused": vc.is_paused(),
+                    "saved_time": time.time(),
+                }
+                if guild_id in song_queues and song_queues[guild_id]:
+                    guild_state["song_queue"] = []
+                    for song in song_queues[guild_id]:
+                        song_data = song.copy()
+                        if hasattr(song_data.get("requested_by"), "id"):
+                            song_data["requested_by_id"] = song_data["requested_by"].id
+                            song_data["requested_by_name"] = song_data["requested_by"].name
+                            del song_data["requested_by"]
+                        guild_state["song_queue"].append(song_data)
+                if guild_id in playlist_queues:
+                    guild_state["playlist_state"] = playlist_queues[guild_id].copy()
+                if guild_id in notification_channels:
+                    guild_state["notification_channel_id"] = notification_channels[guild_id].id
+                playback_state[str(guild_id)] = guild_state
+                saved_count += 1
+            return playback_state
+
+        arken_io.merge_json_file(PLAYBACK_STATE_FILE, patch)
+        if saved_count:
+            print(f"💾 Saved playback state for {saved_count} guild(s) on this container")
             return True
-        else:
-            print("📢 No active playback to save")
-            return False
-        
+        print("📢 No active playback to save on this container")
+        return False
     except Exception as e:
         print(f"⚠️ Error saving playback state: {e}")
         return False
@@ -785,6 +777,9 @@ async def restore_playback_state():
             
             if not guild:
                 print(f"⚠️ Guild {state['guild_name']} not found, skipping playback restore")
+                continue
+
+            if not guild_served_here(guild_id):
                 continue
             
             # Check if bot is in voice channel (should be from auto-rejoin)
@@ -1269,23 +1264,29 @@ def member_can_server_admin(member) -> bool:
 async def _deny_unapproved(ctx) -> bool:
     """True if the command should stop (guild missing, not approved, or not on this token)."""
     if ctx.guild is None:
-        await ctx.send("❌ This command only works inside a Discord server.")
+        await ctx.send(arken_policy.MSG_NO_GUILD)
         return True
     if not guild_is_approved(ctx.guild.id):
         st = GUILD_REGISTRY.status(ctx.guild.id)
         await ctx.send(
-            f"❌ This server is **{st}**. Staff must approve it with "
-            f"`!allowguild {ctx.guild.id}` before Arken will work here."
+            arken_policy.MSG_NOT_APPROVED.format(status=st, gid=ctx.guild.id)
         )
         return True
     if not guild_served_here(ctx.guild.id):
         seat = TOKEN_POOL.seat_of(ctx.guild.id) if TOKEN_POOL.enabled() else None
         tip = f" It is seated as **{seat}**." if seat else ""
-        await ctx.send(
-            f"❌ This server is approved but not served by this bot instance.{tip}"
-        )
+        await ctx.send(arken_policy.MSG_WRONG_TOKEN.format(tip=tip))
         return True
     return False
+
+
+async def _deny_unapproved_guild(guild_id) -> bool:
+    """True if this guild must not use playback UI (for buttons/menus)."""
+    if guild_id is None:
+        return True
+    if not guild_is_approved(guild_id):
+        return True
+    return not guild_served_here(guild_id)
 
 
 def require_staff(*capabilities: str):
@@ -1372,10 +1373,7 @@ def require_control():
                 return
             if not member_can_control(ctx.author):
                 print(f"🚫 Control denied: {ctx.author} ({ctx.author.id}) tried {getattr(ctx.command, 'name', '?')}")
-                await ctx.send(
-                    "❌ **Access denied.** Need the DJ role, Manage Server, "
-                    "`!openplay on`, or be an Arken owner."
-                )
+                await ctx.send(arken_policy.MSG_DJ_DENIED)
                 return
             return await func(*args, **kwargs)
 
@@ -3738,13 +3736,16 @@ async def update_presence():
     global _presence_name
     if not PRESENCE_ENABLED:
         return
+    served_count = sum(1 for g in bot.guilds if guild_served_here(g.id))
     titles = []
-    for src in list(current_sources.values()):
+    for gid, src in list(current_sources.items()):
+        if not guild_served_here(gid):
+            continue
         t = getattr(src, "title", None)
-        if t and not getattr(src, "game", False):  # guessing-game clips must not give the answer away
+        if t and not getattr(src, "game", False):
             titles.append(str(t))
-    # Profile status is global on the Discord account; never show another server's song.
-    shown = tenancy.presence_title(len(bot.guilds), titles)
+    # Profile status is global on the Discord account; count only guilds this token serves.
+    shown = tenancy.presence_title(served_count, titles)
     if shown is None and titles:
         name = tenancy.NEUTRAL_PRESENCE
     else:
@@ -4043,14 +4044,22 @@ class NowPlayingView(discord.ui.View):
         if interaction.guild_id != self.guild_id:
             await interaction.response.send_message("❌ These buttons belong to another server.", ephemeral=True)
             return False
+        if _deny_unapproved_guild(self.guild_id):
+            await interaction.response.send_message(
+                "❌ This server is not approved or not served by this bot.",
+                ephemeral=True,
+                delete_after=8,
+            )
+            return False
         if need_auth:
             guild = interaction.guild or bot.get_guild(self.guild_id)
             member = guild.get_member(interaction.user.id) if guild else None
             if member is None or not member_can_control(member):
                 print(f"🚫 Unauthorized button press: {interaction.user} ({interaction.user.id})")
                 await interaction.response.send_message(
-                    "❌ **Access denied.** Need Manage Server, the DJ role, openplay, or be a bot owner.",
-                    ephemeral=True, delete_after=6,
+                    arken_policy.MSG_DJ_DENIED,
+                    ephemeral=True,
+                    delete_after=6,
                 )
                 return False
         return True
@@ -4062,7 +4071,7 @@ class NowPlayingView(discord.ui.View):
             await interaction.response.send_message(f"❌ {text}", ephemeral=True, delete_after=6)
 
     async def _pause(self, interaction):
-        if not await self._guard(interaction, need_auth=False):
+        if not await self._guard(interaction, need_auth=True):
             return
         vc = _voice_client_for(self.guild_id)
         ok, text = resume_current(self.guild_id) if (vc and vc.is_paused()) else pause_current(self.guild_id)
@@ -4544,7 +4553,7 @@ async def play(ctx, *, query: str):
         print(f"🎵 Streaming file: {os.path.basename(file_path)}")
         
         # Use FFmpegPCMAudio - Discord.py handles Opus encoding internally
-        print(f"🔍 FFmpeg options being used: {ffmpeg_options}")
+        print(f"🔍 FFmpeg options: {arken_audio.ffmpeg_options_for_guild(ctx.guild.id, guild_setting)}")
         print(f"🔍 File path for FFmpeg: {file_path}")
         print(f"🔍 File exists: {os.path.exists(file_path)}")
         print(f"🔍 File size: {os.path.getsize(file_path) if os.path.exists(file_path) else 'N/A'} bytes")
@@ -4580,6 +4589,7 @@ async def play(ctx, *, query: str):
             pass
 
 @bot.command(name="pause", help="Pause audio stream")
+@require_control()
 async def pause(ctx):
     """Pause current stream"""
     ok, text = pause_current(ctx.guild.id)
@@ -4590,6 +4600,7 @@ async def pause(ctx):
         await ctx.send(f"❌ {text}")
 
 @bot.command(name="resume", help="Resume audio stream")
+@require_control()
 async def resume(ctx):
     """Resume stream"""
     ok, text = resume_current(ctx.guild.id)
@@ -4627,6 +4638,7 @@ async def skip_track(ctx):
         await ctx.send(f"❌ {text}")
 
 @bot.command(name="stop", help="Stop audio stream")
+@require_control()
 async def stop(ctx):
     """Stop current stream (and end any active playlist so it doesn't advance to the next track)"""
     ok, text = stop_current(ctx.guild.id)
@@ -4718,6 +4730,7 @@ async def style_cmd(ctx, name: str = None):
                                      *(["colours follow each song's cover art"] if choice == "auto" else [])))
 
 @bot.command(name="kill", help="Disconnect the bot from voice channel")
+@require_user()
 async def kill(ctx):
     """Disconnect from voice channel"""
     if ctx.guild.voice_client:
@@ -5316,7 +5329,7 @@ async def playlist_cmd(ctx, action=None, *, args=None):
             # Start playing first song using global ffmpeg_options
             
             print(f"🔍 About to create FFmpeg source with path: {str(audio_file)}")
-            print(f"🔍 FFmpeg options: {ffmpeg_options}")
+            print(f"🔍 FFmpeg options: {arken_audio.ffmpeg_options_for_guild(ctx.guild.id, guild_setting)}")
             
             try:
                 # Ensure consistent path format for FFmpeg
@@ -5616,71 +5629,45 @@ async def playlist_cmd(ctx, action=None, *, args=None):
     else:
         await ctx.send(f"❌ Unknown action: `{action}`. Use `!playlist` to see available commands.")
 
-@bot.command(name="region", help="Set regional audio settings (staff: diagnose)")
-@require_staff("diagnose")
+@bot.command(name="region", help="Per-server audio decode profile: !region [us|eu|hq|voice]")
 async def set_region(ctx, region: str = None):
-    """Set regional audio processing settings"""
-    global ffmpeg_options
-    
+    """FFmpeg decode profile for *this* guild (saved in arken_settings.json)."""
+    if await _deny_unapproved(ctx):
+        return
+    cur = arken_audio.normalize_region(guild_setting(ctx.guild.id, "ffmpeg_region"))
+    opts = arken_audio.ffmpeg_options_for_region(cur)
+
     if not region:
         embed = discord.Embed(
-            title="🌍 Regional Audio Settings",
-            description="Available regional configurations:",
-            color=0x00ff00
+            title="🌍 Regional audio (this server)",
+            description="Applies to **this** server only — other guilds on the same bot keep their own profile.",
+            color=0x00ff00,
         )
-        
+        embed.add_field(name="Current region", value=f"`{cur}` — {arken_audio.REGION_LABELS[cur]}", inline=False)
         embed.add_field(
-            name="Current Settings",
-            value=f"```{ffmpeg_options['options']}```",
-            inline=False
+            name="Current FFmpeg options",
+            value=f"```{opts['options']}```",
+            inline=False,
         )
-        
         embed.add_field(
-            name="Available Regions",
-            value=(
-                "`!region us` - US/English (48kHz, stereo, 128k)\n"
-                "`!region eu` - European (44.1kHz, stereo, 128k)\n"
-                "`!region hq` - High Quality (48kHz, stereo, 192k)\n"
-                "`!region voice` - Voice optimized (48kHz, mono, 64k)"
-            ),
-            inline=False
+            name="Set (Manage Server)",
+            value="`!region us` · `eu` · `hq` · `voice`",
+            inline=False,
         )
-        
         await ctx.send(embed=embed)
         return
-    
-    region = region.lower()
-    
-    if region == "us":
-        ffmpeg_options = {
-            'before_options': '',
-            'options': '-vn -f s16le -ar 48000 -ac 2 -acodec pcm_s16le -loglevel warning'
-        }
-        await ctx.send("🇺🇸 **US/English audio settings applied:** 48kHz, stereo, PCM")
-        
-    elif region == "eu":
-        ffmpeg_options = {
-            'before_options': '',
-            'options': '-vn -f s16le -ar 44100 -ac 2 -acodec pcm_s16le -loglevel warning'
-        }
-        await ctx.send("🇪🇺 **European audio settings applied:** 44.1kHz, stereo, PCM")
-        
-    elif region == "hq":
-        ffmpeg_options = {
-            'before_options': '',
-            'options': '-vn -f s16le -ar 48000 -ac 2 -acodec pcm_s16le -loglevel warning -af volume=1.2'
-        }
-        await ctx.send("🎵 **High Quality audio settings applied:** 48kHz, stereo, PCM, +20% volume")
-        
-    elif region == "voice":
-        ffmpeg_options = {
-            'before_options': '',
-            'options': '-vn -f s16le -ar 48000 -ac 1 -acodec pcm_s16le -loglevel warning'
-        }
-        await ctx.send("🎤 **Voice optimized settings applied:** 48kHz, mono, PCM")
-        
-    else:
+
+    if not member_can_server_admin(ctx.author):
+        await ctx.send("❌ **Access denied.** Need Manage Server (or be an Arken owner) to change region.")
+        return
+
+    raw = str(region).strip().lower()
+    if raw not in arken_audio.FFMPEG_PRESETS:
         await ctx.send("❌ **Invalid region!** Use: `us`, `eu`, `hq`, or `voice`")
+        return
+    key = arken_audio.normalize_region(raw)
+    set_guild_setting(ctx.guild.id, "ffmpeg_region", key)
+    await ctx.send(f"✅ **{ctx.guild.name}** audio region → **{key}** ({arken_audio.REGION_LABELS[key]})")
 
 # ============================================================================
 # 🛡️ WHITELIST MANAGEMENT COMMANDS
@@ -6287,6 +6274,7 @@ async def rejoin_cmd(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name="voiceregion", help="Show voice channel region info")
+@require_user()
 async def voice_region(ctx):
     """Show voice channel region information and explain region changes"""
     
@@ -6472,7 +6460,7 @@ def make_audio_source(guild_id, path, *, title, duration=0, requester=None, vide
     it implies), the fade setting, a start position and who asked for the track.
     """
     flt, speed = ("", 1.0) if game else guild_effect(guild_id)
-    opts = dict(ffmpeg_options)
+    opts = arken_audio.ffmpeg_options_for_guild(guild_id, guild_setting)
     before = opts.get("before_options", "")
     if start_offset:
         before = f"{before} -ss {float(start_offset):.2f}".strip()
@@ -6643,6 +6631,7 @@ def cast_vote(guild_id, member):
 
 
 @bot.command(name="voteskip", aliases=["vs"], help="Vote to skip the current song (majority of listeners)")
+@require_user()
 async def voteskip_cmd(ctx):
     set_notification_channel(ctx.guild.id, ctx.channel)
     ok, text, passed = cast_vote(ctx.guild.id, ctx.author)
@@ -6815,6 +6804,7 @@ class QueueView(discord.ui.View):
 
 
 @bot.command(name="queue", aliases=["q"], help="Show the queue (interactive: move, play now, remove)")
+@require_user()
 async def show_queue(ctx):
     view = QueueView(ctx.guild.id)
     body = await view.header.sync(ctx, view.render())
@@ -6878,6 +6868,7 @@ async def _send_list(ctx, label, title, items, owner_id=None):
 
 
 @bot.command(name="like", aliases=["fav"], help="Add the song that's playing to your favourites")
+@require_user()
 async def like_cmd(ctx):
     src = current_sources.get(ctx.guild.id)
     title = getattr(src, "title", None)
@@ -6889,6 +6880,7 @@ async def like_cmd(ctx):
 
 
 @bot.command(name="unlike", help="Remove a favourite by its number (see !likes)")
+@require_user()
 async def unlike_cmd(ctx, number: int):
     item = extras.remove_like(DATA, ctx.guild.id, ctx.author.id, number)
     if item is None:
@@ -6898,6 +6890,7 @@ async def unlike_cmd(ctx, number: int):
 
 
 @bot.command(name="likes", aliases=["favs", "favorites"], help="Your favourites: !likes | !likes play [shuffle] | !likes remove N")
+@require_user()
 async def likes_cmd(ctx, action: str = None, *, rest: str = None):
     # Favourites are per Discord server — same user in another server has a separate list.
     likes = extras.get_likes(DATA, ctx.guild.id, ctx.author.id)
@@ -6923,6 +6916,7 @@ async def likes_cmd(ctx, action: str = None, *, rest: str = None):
 
 
 @bot.command(name="history", help="Recently played songs (pick one to queue again)")
+@require_user()
 async def history_cmd(ctx):
     plays = extras.recent_plays(DATA, ctx.guild.id, 15)
     await _send_list(ctx, "history", "recently played", [{"title": p["title"], "vid": p.get("vid")} for p in plays])
@@ -6937,6 +6931,7 @@ _PERIODS = {"day": (86400, "last 24 hours"), "week": (7 * 86400, "last 7 days"),
 
 
 @bot.command(name="stats", help="Listening stats: !stats [day|week|month|all] | !stats recap on|off")
+@require_user()
 async def stats_cmd(ctx, period: str = "week", setting: str = None):
     gid = ctx.guild.id
     period = (period or "week").lower()
@@ -7046,6 +7041,7 @@ async def fetch_lyrics(title, duration=0):
 
 
 @bot.command(name="lyrics", help="Live lyrics under the bar: !lyrics on | off | full")
+@require_user()
 async def lyrics_cmd(ctx, mode: str = None):
     gid = ctx.guild.id
     mode = (mode or "").lower()
@@ -7748,6 +7744,7 @@ async def post_dashboard(dest):
 
 
 @bot.command(name="dashboard", aliases=["menu", "home"], help="Open the dashboard: resume, favourites, radio, quick settings")
+@require_user()
 async def dashboard_cmd(ctx):
     set_notification_channel(ctx.guild.id, ctx.channel)
     await post_dashboard(ctx)
