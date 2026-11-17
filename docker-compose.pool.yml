@@ -47,6 +47,7 @@ services:
       ARKEN_TOKEN_POOL: ${ARKEN_TOKEN_POOL:-gondor,osgiliath,nimloth,morthond}
       ARKEN_MAX_GUILDS_PER_TOKEN: ${ARKEN_MAX_GUILDS_PER_TOKEN:-5}
       ARKEN_METRICS: ${ARKEN_METRICS:-1}
+      ARKEN_METRICS_LEADER: ${ARKEN_METRICS_LEADER:-1}
 
   arken-osgiliath:
     <<: *arken-pool

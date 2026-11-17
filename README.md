@@ -86,7 +86,7 @@ To spread guilds across several Discord bot applications (rate-limit / CPU headr
 3. Run one process/container per **city-token** with `ARKEN_TOKEN_ID` + that bot’s `NEW_DISCORD_TOKEN` (see `docker-compose.pool.yml`).
 4. **Token = which Discord app joined** (`source: invite` in `token_pool.json`). `!allowguild` only approves unless you pass `--auto` (balance first) or `--token city`. Sticky until `!leaveguild`. Use `!tokens` / `!guilds` to inspect.
 
-Playlists/likes/settings stay isolated by Discord guild id — seats are support labels only. Prometheus textfiles land in `data/metrics/` (`ARKEN_METRICS=0` disables).
+Playlists/likes/settings stay isolated by Discord guild id — seats are support labels only. Prometheus textfiles land in `data/metrics/` (`ARKEN_METRICS=0` disables). Full ops stack: see [`deploy/observability/README.md`](deploy/observability/README.md) and `docker-compose.observability.yml`.
 
 ## 🎮 Commands
 

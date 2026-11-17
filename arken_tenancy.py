@@ -27,6 +27,7 @@ import re
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import arken_io
@@ -89,6 +90,59 @@ def has_capability(role: str | None, capability: str) -> bool:
     return capability in role_capabilities(role)
 
 
+def prefer_staff_role(a: str | None, b: str | None) -> str:
+    """Merge role writes: owner wins over operator."""
+    ra = normalize_staff_role(a) or "operator"
+    rb = normalize_staff_role(b) or "operator"
+    if ra == "owner" or rb == "owner":
+        return "owner"
+    return ra
+
+
+DEFAULT_POOL_HEARTBEAT_MAX = 90.0
+
+
+def pool_heartbeat_path(state_dir: Path | str, token_id: str) -> Path:
+    """Per-container liveness stamp in shared STATE_DIR (read by --auto / pick_token)."""
+    tid = str(token_id).strip().lower().replace("/", "-")
+    return Path(state_dir) / f".heartbeat_{tid}"
+
+
+def write_pool_heartbeat(state_dir: Path | str, token_id: str) -> None:
+    path = pool_heartbeat_path(state_dir, token_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.write_text(str(time.time()), encoding="utf-8")
+    except OSError as e:
+        print(f"⚠️ Could not write pool heartbeat {path.name}: {e}")
+
+
+def pool_heartbeat_age(state_dir: Path | str, token_id: str) -> float | None:
+    path = pool_heartbeat_path(state_dir, token_id)
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        return max(0.0, time.time() - float(raw))
+    except (OSError, ValueError):
+        return None
+
+
+def token_container_alive(
+    state_dir: Path | str,
+    token_id: str,
+    *,
+    local_token_id: str | None = None,
+    max_age: float = DEFAULT_POOL_HEARTBEAT_MAX,
+) -> bool:
+    """Other containers need a fresh heartbeat; this process always counts its own token as up."""
+    tid = str(token_id).strip().lower()
+    if local_token_id and tid == str(local_token_id).strip().lower():
+        return True
+    age = pool_heartbeat_age(state_dir, tid)
+    if age is None:
+        return False
+    return age <= max(5.0, float(max_age))
+
+
 def can_control(
     *,
     global_control: bool = False,
@@ -114,6 +168,7 @@ class StaffDirectory:
         self.path = Path(path)
         self.lock = threading.RLock()
         self.users: dict[str, dict] = {}  # uid -> {"role": "owner"|"operator"}
+        self._removed_users: set[str] = set()
         self.load()
 
     def load(self) -> None:
@@ -151,18 +206,35 @@ class StaffDirectory:
 
     def save(self) -> None:
         with self.lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            # Keep authorized_users for sync_state / older readers (everyone on the staff list).
-            payload = {
-                "version": 2,
-                "users": {uid: {"role": meta["role"]} for uid, meta in sorted(self.users.items())},
-                "authorized_users": [int(uid) for uid in sorted(self.users, key=int)],
-                "last_updated": time.time(),
-            }
-            tmp = self.path.with_name("." + self.path.name + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, self.path)
+            local_users = {uid: dict(meta) for uid, meta in self.users.items()}
+            removals = set(self._removed_users)
+
+            def patch(current: dict) -> dict:
+                disk_users = current.get("users")
+                if not isinstance(disk_users, dict):
+                    disk_users = {}
+                merged: dict[str, dict] = {}
+                for uid, meta in disk_users.items():
+                    if str(uid) not in removals and isinstance(meta, dict):
+                        merged[str(uid)] = {"role": normalize_staff_role(meta.get("role")) or "owner"}
+                for uid in local_users:
+                    role = prefer_staff_role(
+                        merged.get(uid, {}).get("role"),
+                        local_users[uid].get("role"),
+                    )
+                    merged[uid] = {"role": role}
+                for uid in removals:
+                    merged.pop(str(uid), None)
+                return {
+                    "version": 2,
+                    "users": {uid: merged[uid] for uid in sorted(merged, key=int)},
+                    "authorized_users": [int(uid) for uid in sorted(merged, key=int)],
+                    "last_updated": time.time(),
+                }
+
+            arken_io.merge_json_file(self.path, patch)
+            self._removed_users.clear()
+            self.load()
 
     def role_of(self, user_id) -> str | None:
         with self.lock:
@@ -195,9 +267,11 @@ class StaffDirectory:
 
     def remove(self, user_id) -> bool:
         with self.lock:
-            if str(user_id) not in self.users:
+            key = str(user_id)
+            if key not in self.users:
                 return False
-            del self.users[str(user_id)]
+            del self.users[key]
+            self._removed_users.add(key)
             self.save()
             return True
 
@@ -484,6 +558,7 @@ class TokenPool:
         weight_guild: float = DEFAULT_WEIGHT_GUILD,
         weight_active: float = DEFAULT_WEIGHT_ACTIVE,
         weight_members: float = DEFAULT_WEIGHT_MEMBERS,
+        alive_filter: Callable[[str], bool] | None = None,
     ):
         self.path = Path(path)
         self.lock = threading.RLock()
@@ -492,6 +567,7 @@ class TokenPool:
         self.weight_guild = float(weight_guild)
         self.weight_active = float(weight_active)
         self.weight_members = float(weight_members)
+        self.alive_filter = alive_filter
         self.assignments: dict[str, dict] = {}  # guild_id -> meta
         self.runtime: dict[str, dict] = {}  # token_id -> {active_players, updated}
         self._removed_guilds: set[str] = set()  # pending deletes for cross-container merge
@@ -689,13 +765,32 @@ class TokenPool:
     def has_slot(self, token_id: str) -> bool:
         return len(self.guilds_on(token_id)) < self.max_guilds_per_token
 
+    def token_alive(self, token_id: str) -> bool:
+        if self.alive_filter is None:
+            return True
+        try:
+            return bool(self.alive_filter(str(token_id)))
+        except Exception:
+            return False
+
     def pick_token(self) -> str:
         """Least-loaded token with a free guild slot. Raises PoolFullError if none."""
         with self.lock:
             if not self.token_ids:
                 raise PoolFullError("token pool is empty — set ARKEN_TOKEN_POOL")
-            candidates = [tid for tid in self.token_ids if self.has_slot(tid)]
+            candidates = [
+                tid for tid in self.token_ids if self.has_slot(tid) and self.token_alive(tid)
+            ]
             if not candidates:
+                dead = [
+                    tid
+                    for tid in self.token_ids
+                    if self.has_slot(tid) and not self.token_alive(tid)
+                ]
+                if dead:
+                    raise PoolFullError(
+                        f"no alive token with free slots — offline/stale heartbeat: {', '.join(dead)}"
+                    )
                 raise PoolFullError(
                     f"all {len(self.token_ids)} token(s) at cap "
                     f"({self.max_guilds_per_token} guilds each)"
@@ -858,6 +953,7 @@ class TokenPool:
                     "slots_free": max(0, self.max_guilds_per_token - len(gids)),
                     "load_score": round(self.score(tid), 4),
                     "at_cap": len(gids) >= self.max_guilds_per_token,
+                    "alive": self.token_alive(tid),
                 })
             return {
                 "enabled": self.enabled(),

@@ -455,7 +455,6 @@ notification_channels = {}  # {guild_id: channel} - tracks where to send music n
 
 # Voice channel state management
 VOICE_STATE_FILE = _state_file("voice_state.json")
-PLAYBACK_STATE_FILE = _state_file("playback_state.json")
 
 def set_notification_channel(guild_id, channel):
     """Set the notification channel for a guild"""
@@ -717,7 +716,7 @@ def save_playback_state():
                 saved_count += 1
             return playback_state
 
-        arken_io.merge_json_file(PLAYBACK_STATE_FILE, patch)
+        arken_io.merge_json_file(_playback_state_path(), patch)
         if saved_count:
             print(f"💾 Saved playback state for {saved_count} guild(s) on this container")
             return True
@@ -727,11 +726,26 @@ def save_playback_state():
         print(f"⚠️ Error saving playback state: {e}")
         return False
 
+def _playback_state_path() -> Path:
+    """Per-token playback file in a pool; legacy single-file name when TOKEN_ID unset."""
+    tid = (TOKEN_ID or "").strip().lower()
+    if tid:
+        path = _state_file(f"playback_state.{tid}.json")
+        if path.exists():
+            return path
+        legacy = _state_file("playback_state.json")
+        if legacy.exists():
+            return legacy
+        return path
+    return _state_file("playback_state.json")
+
+
 def load_playback_state():
     """Load saved playback state"""
     try:
-        if PLAYBACK_STATE_FILE.exists():
-            with open(PLAYBACK_STATE_FILE, 'r') as f:
+        pstate = _playback_state_path()
+        if pstate.exists():
+            with open(pstate, "r", encoding="utf-8") as f:
                 playback_state = json.load(f)
             
             # Clean up old state files (older than 1 hour)
@@ -754,8 +768,9 @@ def load_playback_state():
 def clear_playback_state():
     """Clear saved playback state file"""
     try:
-        if PLAYBACK_STATE_FILE.exists():
-            PLAYBACK_STATE_FILE.unlink()
+        pstate = _playback_state_path()
+        if pstate.exists():
+            pstate.unlink()
             print("🧹 Cleared playback state file")
     except Exception as e:
         print(f"⚠️ Error clearing playback state: {e}")
@@ -960,6 +975,20 @@ _pool_ids = tenancy.parse_token_pool_env(aenv.get("TOKEN_POOL"))
 if not _pool_ids and TOKEN_ID:
     _pool_ids = [TOKEN_ID]
 
+_STATE_DIR_PATH = Path(aenv.get("STATE_DIR", "").strip() or str(_project_root()))
+_POOL_HEARTBEAT_MAX = aenv.float_value("POOL_HEARTBEAT_MAX", tenancy.DEFAULT_POOL_HEARTBEAT_MAX)
+
+
+def _pool_token_alive(token_id: str) -> bool:
+    if len(_pool_ids) < 2:
+        return True
+    return tenancy.token_container_alive(
+        _STATE_DIR_PATH,
+        token_id,
+        local_token_id=TOKEN_ID,
+        max_age=_POOL_HEARTBEAT_MAX,
+    )
+
 
 TOKEN_POOL = tenancy.TokenPool(
     _state_file("token_pool.json"),
@@ -968,6 +997,7 @@ TOKEN_POOL = tenancy.TokenPool(
     weight_guild=aenv.float_value("POOL_WEIGHT_GUILD", tenancy.DEFAULT_WEIGHT_GUILD),
     weight_active=aenv.float_value("POOL_WEIGHT_ACTIVE", tenancy.DEFAULT_WEIGHT_ACTIVE),
     weight_members=aenv.float_value("POOL_WEIGHT_MEMBERS", tenancy.DEFAULT_WEIGHT_MEMBERS),
+    alive_filter=_pool_token_alive if len(_pool_ids) > 1 else None,
 )
 if TOKEN_POOL.enabled() and not TOKEN_ID:
     print(
@@ -978,12 +1008,19 @@ if TOKEN_POOL.enabled() and not TOKEN_ID:
 _METRICS_ENABLED = aenv.get("METRICS", "1").strip().lower() not in (
     "0", "false", "no", "off",
 )
+_METRICS_LEADER = aenv.truthy("METRICS_LEADER")
 _METRICS_WRITER = None
+_PROCESS_METRICS_WRITER = None
 if _METRICS_ENABLED:
     _metrics_dir = aenv.get("STATE_DIR", "").strip() or str(_project_root())
-    _METRICS_WRITER = metrics.MetricsWriter(
-        metrics.default_metrics_path(_metrics_dir, TOKEN_ID)
-    )
+    if _METRICS_LEADER or not TOKEN_ID:
+        _METRICS_WRITER = metrics.MetricsWriter(
+            metrics.default_metrics_path(_metrics_dir, "pool")
+        )
+    if TOKEN_ID:
+        _PROCESS_METRICS_WRITER = metrics.MetricsWriter(
+            metrics.process_metrics_path(_metrics_dir, TOKEN_ID)
+        )
 
 
 def load_whitelist():
@@ -1166,9 +1203,18 @@ def _count_active_players() -> int:
     return n
 
 
+def _heartbeat_ages_for_pool() -> dict[str, float]:
+    ages: dict[str, float] = {}
+    if not TOKEN_POOL.enabled():
+        return ages
+    for tid in TOKEN_POOL.token_ids:
+        age = tenancy.pool_heartbeat_age(_STATE_DIR_PATH, tid)
+        if age is not None:
+            ages[str(tid)] = age
+    return ages
+
+
 def _write_pool_metrics() -> None:
-    if not _METRICS_WRITER:
-        return
     try:
         snap = TOKEN_POOL.snapshot() if TOKEN_POOL.enabled() else {
             "enabled": False,
@@ -1177,7 +1223,31 @@ def _write_pool_metrics() -> None:
             "assigned_guilds": 0,
             "tokens": [],
         }
-        _METRICS_WRITER.write(metrics.render_pool_prometheus(snap, token_id=TOKEN_ID))
+        if _METRICS_WRITER:
+            _METRICS_WRITER.write(
+                metrics.render_pool_prometheus(
+                    snap,
+                    token_id=TOKEN_ID,
+                    heartbeat_ages=_heartbeat_ages_for_pool(),
+                )
+            )
+        if _PROCESS_METRICS_WRITER and TOKEN_ID:
+            served = sum(1 for g in bot.guilds if guild_served_here(g.id))
+            voice = sum(
+                1
+                for g in bot.guilds
+                if guild_served_here(g.id) and g.voice_client and g.voice_client.is_connected()
+            )
+            hb = tenancy.pool_heartbeat_age(_STATE_DIR_PATH, TOKEN_ID)
+            _PROCESS_METRICS_WRITER.write(
+                metrics.render_process_prometheus(
+                    token_id=TOKEN_ID,
+                    guilds_served=served,
+                    active_players=_count_active_players(),
+                    voice_connected=voice,
+                    heartbeat_age=hb,
+                )
+            )
     except Exception as e:
         print(f"⚠️ metrics write failed: {e}")
 
@@ -1185,6 +1255,8 @@ def _write_pool_metrics() -> None:
 async def _pool_stats_loop():
     """Refresh per-token active players + member counts; emit Prometheus textfile."""
     await bot.wait_until_ready()
+    if TOKEN_POOL.enabled() and TOKEN_ID:
+        tenancy.write_pool_heartbeat(_STATE_DIR_PATH, TOKEN_ID)
     while not bot.is_closed():
         try:
             if TOKEN_POOL.enabled() and TOKEN_ID:
@@ -1206,6 +1278,7 @@ async def _pool_stats_loop():
                 else:
                     # Still refresh runtime timestamp occasionally for other processes.
                     TOKEN_POOL.touch()
+                tenancy.write_pool_heartbeat(_STATE_DIR_PATH, TOKEN_ID)
             _write_pool_metrics()
         except Exception as e:
             print(f"⚠️ pool stats loop: {e}")
@@ -1335,6 +1408,46 @@ def require_staff(*capabilities: str):
 def require_owner():
     """Decorator: staff role owner only (manage_staff and everything else)."""
     return require_staff("manage_staff")
+
+
+def require_fleet_runtime(func):
+    """Restart/deps/rejoin: must run in a guild this token serves; operators need home guild when multi-guild."""
+    import functools
+
+    @require_staff("manage_runtime")
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        ctx = args[0] if args else None
+        if not ctx or not hasattr(ctx, "guild"):
+            return await func(*args, **kwargs)
+        if ctx.guild is None:
+            await ctx.send("❌ Run `!reboot` / `!deps` / `!rejoin` in a server where **this** city bot is present.")
+            return
+        if await _deny_unapproved(ctx):
+            return
+        if TOKEN_POOL.enabled() and not guild_served_here(ctx.guild.id):
+            locked = TOKEN_POOL.token_of(ctx.guild.id)
+            city = tenancy.display_token_name(locked) if locked else "another city"
+            await ctx.send(f"❌ This server is served by **{city}**, not this bot.")
+            return
+        served = sum(1 for g in bot.guilds if guild_served_here(g.id))
+        if served > 1 and not is_owner(ctx.author.id):
+            home = aenv.get("HOME_GUILD", "").strip()
+            if not home:
+                await ctx.send(
+                    "❌ **Operators:** this bot serves multiple guilds — set `ARKEN_HOME_GUILD` "
+                    "and run fleet runtime commands there, or ask an **owner**."
+                )
+                return
+            if str(ctx.guild.id) != home:
+                await ctx.send(
+                    f"❌ **Operators:** run fleet runtime commands from home server `{home}` "
+                    f"(set `ARKEN_HOME_GUILD`), or ask an **owner**."
+                )
+                return
+        return await func(*args, **kwargs)
+
+    return wrapper
 
 
 def require_server_admin():
@@ -3585,6 +3698,7 @@ async def _finish_summon(msg, anim, content):
 SETTINGS_FILE = _resolve_state_json("arken_settings.json", "gondor_settings.json")
 NOTE_SECONDS = max(0.0, float(aenv.get("NOTE_SECONDS", "12")))
 PRESENCE_ENABLED = aenv.flag("PRESENCE")
+PRESENCE_NEUTRAL = aenv.truthy("PRESENCE_NEUTRAL")
 NP_COUNTDOWN = aenv.flag("NP_COUNTDOWN")
 NP_BUTTONS_ENABLED = aenv.flag("NP_BUTTONS")
 DEFAULT_VOLUME = 0.8
@@ -3745,11 +3859,14 @@ async def update_presence():
         if t and not getattr(src, "game", False):
             titles.append(str(t))
     # Profile status is global on the Discord account; count only guilds this token serves.
-    shown = tenancy.presence_title(served_count, titles)
-    if shown is None and titles:
+    if PRESENCE_NEUTRAL and titles:
         name = tenancy.NEUTRAL_PRESENCE
     else:
-        name = shown
+        shown = tenancy.presence_title(served_count, titles)
+        if shown is None and titles:
+            name = tenancy.NEUTRAL_PRESENCE
+        else:
+            name = shown
     if name == _presence_name:
         return
     _presence_name = name
@@ -5902,12 +6019,18 @@ async def tokens_cmd(ctx):
         mark = "🔴" if tok["at_cap"] else ("🟢" if tok["slots_free"] else "🟡")
         mine = " ← here" if tok["token_id"] == TOKEN_ID else ""
         city = tok.get("display_name") or tok["token_id"]
+        alive = tok.get("alive", True)
+        pulse = "💓" if alive else "💤"
+        hb = ""
+        if len(_pool_ids) > 1 and tok["token_id"] != TOKEN_ID:
+            age = tenancy.pool_heartbeat_age(_STATE_DIR_PATH, tok["token_id"])
+            hb = f" · heartbeat {int(age)}s ago" if age is not None else " · no heartbeat"
         lines.append(
-            f"{mark} **{city}** (`{tok['token_id']}`){mine} — "
+            f"{mark}{pulse} **{city}** (`{tok['token_id']}`){mine} — "
             f"{tok['guilds']}/{snap['max_guilds_per_token']} guilds · "
             f"{tok['members_total']} members · "
             f"{tok['active_players']} playing · "
-            f"score {tok['load_score']}"
+            f"score {tok['load_score']}{hb}"
         )
         for seat in tok.get("seats") or []:
             label = seat.get("seat") or seat.get("callsign") or "?"
@@ -6134,7 +6257,7 @@ async def djrole_cmd(ctx, *, arg: str = None):
 
 
 @bot.command(name="deps", help="Upgrade Python dependencies (staff: manage_runtime)")
-@require_staff("manage_runtime")
+@require_fleet_runtime
 async def deps_cmd(ctx, action: str = None):
     """Run pip install -U -r requirements.txt on the host (same Python as the bot)."""
     if not action or action.lower() not in ("update", "upgrade", "sync"):
@@ -6158,7 +6281,7 @@ async def deps_cmd(ctx, action: str = None):
         await ctx.send("❌ **Dependency update failed.** Check the machine console for pip output.")
 
 @bot.command(name="reboot", help="Restart the bot (staff: manage_runtime)")
-@require_staff("manage_runtime")
+@require_fleet_runtime
 async def reboot_bot(ctx):
     """Restart the bot - authorized users only"""
     
@@ -6245,7 +6368,7 @@ async def reboot_bot(ctx):
         await bot.close()
 
 @bot.command(name="rejoin", help="Rejoin saved voice channels (staff: manage_runtime)")
-@require_staff("manage_runtime")
+@require_fleet_runtime
 async def rejoin_cmd(ctx):
     """Manually rejoin saved voice channels"""
     

@@ -1,0 +1,28 @@
+groups:
+  - name: arken_pool
+    rules:
+      - alert: ArkenTokenDown
+        expr: arken_token_alive == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Arken city {{ $labels.token_id }} heartbeat missing"
+          description: "Container heartbeat stale or city offline for 2m."
+
+      - alert: ArkenTokenAtCap
+        expr: arken_token_at_cap == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Arken {{ $labels.token_id }} at guild cap"
+          description: "No free seats on this token — invite another city or raise cap."
+
+      - alert: ArkenHeartbeatStale
+        expr: arken_token_heartbeat_age_seconds > 120
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Arken {{ $labels.token_id }} heartbeat age {{ $value }}s"

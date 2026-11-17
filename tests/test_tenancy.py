@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -202,6 +203,80 @@ class StartupMigrationTests(unittest.TestCase):
             self.assertEqual(t.likes_list(data, 555, 7)[0]["vid"], "v")
 
 
+class StaffMergeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "user_whitelist.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_merge_adds_without_clobber(self):
+        a = t.StaffDirectory(self.path)
+        a.set_role(1, "owner")
+        b = t.StaffDirectory(self.path)
+        b.set_role(2, "operator")
+        c = t.StaffDirectory(self.path)
+        self.assertEqual(c.role_of(1), "owner")
+        self.assertEqual(c.role_of(2), "operator")
+
+    def test_merge_owner_wins(self):
+        self.path.write_text(
+            json.dumps({"version": 2, "users": {"5": {"role": "operator"}}}),
+            encoding="utf-8",
+        )
+        a = t.StaffDirectory(self.path)
+        a.set_role(5, "owner")
+        b = t.StaffDirectory(self.path)
+        self.assertEqual(b.role_of(5), "owner")
+
+    def test_merge_remove_propagates(self):
+        a = t.StaffDirectory(self.path)
+        a.set_role(9, "operator")
+        a.remove(9)
+        b = t.StaffDirectory(self.path)
+        self.assertIsNone(b.role_of(9))
+
+
+class PoolHeartbeatTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_heartbeat_alive_self_always(self):
+        self.assertTrue(
+            t.token_container_alive(self.state, "gondor", local_token_id="gondor", max_age=10)
+        )
+
+    def test_heartbeat_stale_other(self):
+        t.write_pool_heartbeat(self.state, "osgiliath")
+        self.assertTrue(
+            t.token_container_alive(self.state, "osgiliath", local_token_id="gondor", max_age=90)
+        )
+        path = t.pool_heartbeat_path(self.state, "osgiliath")
+        path.write_text(str(time.time() - 200), encoding="utf-8")
+        self.assertFalse(
+            t.token_container_alive(self.state, "osgiliath", local_token_id="gondor", max_age=90)
+        )
+
+    def test_pick_token_skips_dead(self):
+        pool_path = Path(self.tmp.name) / "token_pool.json"
+        alive = {"t0": True, "t1": False}
+
+        def filt(tid):
+            return alive.get(tid, False)
+
+        pool = t.TokenPool(pool_path, token_ids=["t0", "t1"], max_guilds_per_token=2, alive_filter=filt)
+        pool.assign(100, token_id="t0")
+        self.assertEqual(pool.assign(101), "t0")
+        with self.assertRaises(t.PoolFullError) as ctx:
+            pool.assign(102)
+        self.assertIn("heartbeat", str(ctx.exception).lower())
+
+
 class TokenPoolTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -357,6 +432,14 @@ class MetricsTests(unittest.TestCase):
             token_id="t0",
         )
         self.assertIn("arken_token_guilds{", text)
+        text2 = m.render_process_prometheus(
+            token_id="gondor",
+            guilds_served=2,
+            active_players=1,
+            voice_connected=1,
+            heartbeat_age=3.5,
+        )
+        self.assertIn("arken_process_active_players", text2)
         self.assertIn('token_id="t0"', text)
         self.assertIn("arken_process_token_info", text)
 
